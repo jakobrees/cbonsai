@@ -16,21 +16,33 @@
 
 /*
 
+	==== Change Ideas: ====
 
-sudo env PKG_CONFIG_PATH="/opt/homebrew/opt/ncurses/lib/pkgconfig" \
-LDFLAGS="-L/opt/homebrew/opt/ncurses/lib" \
-CPPFLAGS="-I/opt/homebrew/opt/ncurses/include" \
-make install
+	Make branching likelihood proportional to life of main trunk
+		- For a brief period at start make shoots very unlikely
 
+	Have turnk growing phases where there is no branching possible
+	and vertical growth is unlikely (yes back and forth growth)
+		- cause snaking behavior
+		- cause thicker trunk (more so at bottom?)
+		- critical: grow the base trunk in the pot. (looks more natural)
+					reuqires checking of base stuff. We could maintain as
+					we are on lowest level.
+
+	Try leaf phases where droopy leaves are added
+		- May require (leaf-shoot type)
+
+	Try not to overwrite leaves (random chance ~30% that we do)
+		- Requires chekcing ncurses object(?)
+		- May be too much and unecessary
+
+	We want distinct branches, how can we do this? Increase branching cooldown
 
 */
-
-#define BRANCH_HISTORY 3 // moving average for proceedural leaves
 
 enum branchType {trunk, shootLeft, shootRight, dying, dead};
 
 struct config {
-	unsigned long long targetGlobalTime;
 	int live;
 	int infinite;
 	int screensaver;
@@ -43,7 +55,7 @@ struct config {
 	int leavesSize;
 	int save;
 	int load;
-	int proceduralMode;
+	int targetBranchCount;
 
 	double timeWait;
 	double timeStep;
@@ -67,11 +79,10 @@ struct ncursesObjects {
 };
 
 struct counters {
-	int trunks;
+    int trunks;
 	int branches;
 	int shoots;
 	int shootCounter;
-	unsigned long long globalTime;
 };
 
 void delObjects(struct ncursesObjects *objects) {
@@ -89,19 +100,13 @@ void delObjects(struct ncursesObjects *objects) {
 }
 
 void quit(struct config *conf, struct ncursesObjects *objects, int returnCode) {
-	if (conf->proceduralMode) {
-		// Restore original tree panel if we're in procedural mode (prevent error)
-		if (!objects->treePanel) {
-			objects->treePanel = new_panel(objects->treeWin);
-		}
-	}
 	delObjects(objects);
 	free(conf->saveFile);
 	free(conf->loadFile);
 	exit(returnCode);
 }
 
-int saveToFile(char* fname, int seed, unsigned long long globalTime) {
+int saveToFile(char* fname, int seed, int branchCount) {
 	FILE *fp = fopen(fname, "w");
 
 	if (!fp) {
@@ -109,7 +114,7 @@ int saveToFile(char* fname, int seed, unsigned long long globalTime) {
 		return 1;
 	}
 
-	fprintf(fp, "%d %llu", seed, globalTime);
+	fprintf(fp, "%d %d", seed, branchCount);
 	fclose(fp);
 
 	return 0;
@@ -124,15 +129,14 @@ int loadFromFile(struct config *conf) {
 		return 1;
 	}
 
-	int seed;
-	unsigned long long targetGlobalTime;
-	if (fscanf(fp, "%i %llu", &seed, &targetGlobalTime) != 2) {
+	int seed, targetBranchCount;
+	if (fscanf(fp, "%i %i", &seed, &targetBranchCount) != 2) {
 		printf("error: save file could not be read\n");
 		return 1;
 	}
 
 	conf->seed = seed;
-	conf->targetGlobalTime = targetGlobalTime;
+	conf->targetBranchCount = targetBranchCount;
 
 	fclose(fp);
 
@@ -144,7 +148,7 @@ void finish(const struct config *conf, struct counters *myCounters) {
 	refresh();
 	endwin();	// delete ncurses screen
 	if (conf->save)
-		saveToFile(conf->saveFile, conf->seed, myCounters->globalTime);
+		saveToFile(conf->saveFile, conf->seed, myCounters->branches);
 }
 
 void printHelp(void) {
@@ -157,7 +161,6 @@ void printHelp(void) {
 			"  -l, --live             live mode: show each step of growth\n"
 			"  -t, --time=TIME        in live mode, wait TIME secs between\n"
 			"                           steps of growth (must be larger than 0) [default: 0.03]\n"
-			"  -P, --procedural       enable procedural leaf generation mode\n"
 			"  -i, --infinite         infinite mode: keep growing trees\n"
 			"  -w, --wait=TIME        in infinite mode, wait TIME between each tree\n"
 			"                           generation [default: 4.00]\n"
@@ -188,9 +191,9 @@ void drawBase(WINDOW* baseWin, int baseType) {
 		wattron(baseWin, COLOR_PAIR(2));
 		wprintw(baseWin, "%s", "__________");
 		wattron(baseWin, COLOR_PAIR(11));
-		wprintw(baseWin, "%s", "./~~~~\\.");
+		wprintw(baseWin, "%s", "./~~~~~\\.");
 		wattron(baseWin, COLOR_PAIR(2));
-		wprintw(baseWin, "%s", "___________");
+		wprintw(baseWin, "%s", "__________");
 		wattron(baseWin, COLOR_PAIR(8));
 		wprintw(baseWin, "%s", ":");
 
@@ -206,9 +209,9 @@ void drawBase(WINDOW* baseWin, int baseType) {
 		wattron(baseWin, COLOR_PAIR(2));
 		wprintw(baseWin, "%s", "---");
 		wattron(baseWin, COLOR_PAIR(11));
-		wprintw(baseWin, "%s", "./~~~~\\.");
+		wprintw(baseWin, "%s", "./~~~\\.");
 		wattron(baseWin, COLOR_PAIR(2));
-		wprintw(baseWin, "%s", "--");
+		wprintw(baseWin, "%s", "---");
 		wattron(baseWin, COLOR_PAIR(8));
 		wprintw(baseWin, "%s", ")");
 
@@ -258,8 +261,7 @@ static inline void roll(int *dice, int mod) { *dice = rand() % mod; }
 
 // check for key press
 int checkKeyPress(const struct config *conf, struct counters *myCounters) {
-	int ch = wgetch(stdscr);
-	if ((conf->screensaver && ch != ERR) || ch == 'q') {
+	if ((conf->screensaver && wgetch(stdscr) != ERR) || (wgetch(stdscr) == 'q')) {
 		finish(conf, myCounters);
 		return 1;
 	}
@@ -300,83 +302,9 @@ void chooseColor(enum branchType type, WINDOW* treeWin) {
 	}
 }
 
-// New structures to add
-struct Branch {
-	int x, y;                   // Current position
-	int dx, dy;                 // Current direction
-	int life;                   // Remaining life
-	int age;                    // Current age
-	enum branchType type;       // Branch type (trunk, shootLeft, etc)
-	int shootCooldown;          // Current shoot cooldown
-	int dripLeafCooldown;       // Current drip leaf cooldown
-	int totalLife;              // Initial life value
-	int multiplier;             // Stored multiplier
-	unsigned int leaf_seed;		// for proceedural consistency
-	int x_history[BRANCH_HISTORY];          // Circular buffer for last BRANCH_HISTORY x positions
-	int y_history[BRANCH_HISTORY];          // Circular buffer for last BRANCH_HISTORY y positions
-	int history_count;         // How many positions we've stored (max BRANCH_HISTORY)
-	int history_index;         // Current index in circular buffer
-};
-
-struct BranchList {
-	struct Branch* branches;    // Dynamic array of branches
-	int count;                  // Current number of branches
-	int capacity;              // Current capacity of array
-};
-
-void initBranchList(struct BranchList* list) {
-	list->capacity = 16;  // Initial capacity
-	list->count = 0;
-	list->branches = malloc(sizeof(struct Branch) * list->capacity);
-}
-
-void addBranch(struct BranchList* list, struct Branch branch, struct counters *myCounters) {
-	myCounters->branches++;
-	if (list->count >= list->capacity) {
-		list->capacity *= 2;
-		list->branches = realloc(list->branches, sizeof(struct Branch) * list->capacity);
-	}
-	list->branches[list->count++] = branch;
-}
-
-void removeBranch(struct BranchList* list, int index) {
-	if (index >= list->count) return;
-	memmove(&list->branches[index], &list->branches[index + 1], 
-			sizeof(struct Branch) * (list->count - index - 1));
-	list->count--;
-}
-
-void freeBranchList(struct BranchList* list) {
-	free(list->branches);
-	list->branches = NULL;
-	list->count = 0;
-	list->capacity = 0;
-}
-
-static inline void update_position_history(struct Branch* branch) {
-	// Add new position to history
-	branch->x_history[branch->history_index] = branch->x;
-	branch->y_history[branch->history_index] = branch->y;
-	
-	// Update count and index
-	if (branch->history_count < BRANCH_HISTORY) {
-		branch->history_count++;
-	}
-	branch->history_index = (branch->history_index + 1) % BRANCH_HISTORY;
-}
-
-static inline void get_average_position(struct Branch* branch, int* avg_x, int* avg_y) {
-	int sum_x = 0, sum_y = 0;
-	
-	// Use all available history points
-	for (int i = 0; i < branch->history_count; i++) {
-		sum_x += branch->x_history[i];
-		sum_y += branch->y_history[i];
-	}
-	
-	// Calculate averages
-	*avg_x = sum_x / (branch->history_count > 0 ? branch->history_count : 1);
-	*avg_y = sum_y / (branch->history_count > 0 ? branch->history_count : 1);
+// Check if we're in the mid trunk phase (first 30% of life)
+static inline int isMidTrunk(int age, int totalLife) {
+	return age < (totalLife * 6 / 10);  // 60% of total life
 }
 
 // Check if we're in the early trunk phase (first 30% of life)
@@ -547,7 +475,7 @@ char* chooseString(const struct config *conf, enum branchType type, int life, in
 
 // Calculate branching roll threshold based on age (higher number = less likely to branch)
 static inline int getBranchRollThreshold(int age, int totalLife, int multiplier) {
-	// Base dice of 12, lower number = more branching
+    // Base dice of 12, lower number = more branching
 	int dice = 3;  // Base roll threshold (1/3 chance)
 
 	if (isYoungTrunk(age, totalLife)) {
@@ -566,245 +494,150 @@ static inline int getBranchRollThreshold(int age, int totalLife, int multiplier)
 			dice = 5 - (multiplier/10);  // Base 1/4 chance near bottom
 		}
 	}
-	
-	return dice;
+    
+    return dice;
 }
 
-void updateBranch(struct config *conf, struct ncursesObjects *objects, 
-				struct counters *myCounters, struct Branch* branch, 
-				struct BranchList* list) {
+void branch(struct config *conf, struct ncursesObjects *objects, struct counters *myCounters, int y, int x, enum branchType type, int life) {
+	myCounters->branches++;
+	int dx = 0;
+	int dy = 0;
+	int age = 0;
+	int shootCooldown = conf->multiplier;
+    int dripLeafCooldown = conf->multiplier + life / 4;
 
-	// Simulate one step of branch growth
-	if (checkKeyPress(conf, myCounters) == 1)
-		quit(conf, objects, 0);
+	while (life > 0) {
+		if (checkKeyPress(conf, myCounters) == 1)
+			quit(conf, objects, 0);
 
-	branch->life--;     // decrement remaining life counter
+		life--;		// decrement remaining life counter
 
-	// Random die-off check - more likely on shoots
-	if (branch->type == trunk) {
-		if (rand() % 66 == 0) {   // 2% chance for trunk
-			branch->life -= (branch->life/2);  // Lose 1/4 of life
-		}
-	} else if (branch->type == shootLeft || branch->type == shootRight) {
-		if (rand() % 20 == 0) {    // 5% chance for shoots
-			branch->life /= 2;      // Lose half of life
-		}
-	}
-
-	branch->age++;
-
-	setDeltas(branch->type, branch->life, branch->totalLife, 
-			  branch->age, branch->multiplier, &branch->dx, &branch->dy);
-
-	int maxY = getmaxy(objects->treeWin);
-	if (branch->dy > 0 && branch->y > (maxY - 2)) 
-		branch->dy--; // reduce dy if too close to the ground
-
-	// near-dead branch should branch into a lot of leaves
-	if (branch->life < 6) {
-		struct Branch newBranch = {
-			.x = branch->x,
-			.y = branch->y,
-			.type = dead,
-			.life = branch->life,
-			.age = 0,
-			.totalLife = branch->life,
-			.multiplier = branch->multiplier,
-			.shootCooldown = conf->multiplier,
-			.dripLeafCooldown = branch->life / 4,
-			.leaf_seed = rand(),
-			.history_count = 0,
-			.history_index = 0,
-			.x_history[0] = branch->x,
-			.y_history[0] = branch->y
-		};
-		addBranch(list, newBranch, myCounters);
-	}
-	else if (branch->type == shootLeft || branch->type == shootRight) {
-		if (branch->life < 7 + (branch->multiplier /5)) {
-			struct Branch newBranch = {
-				.x = branch->x,
-				.y = branch->y,
-				.type = dying,
-				.life = branch->life + 1,
-				.age = 0,
-				.totalLife = branch->life + 1,
-				.multiplier = branch->multiplier,
-				.shootCooldown = conf->multiplier,
-				.dripLeafCooldown = (branch->life + 1) / 4,
-				.leaf_seed = rand(),
-				.history_count = 0,
-				.history_index = 0,
-				.x_history[0] = branch->x,
-				.y_history[0] = branch->y
-			};
-			addBranch(list, newBranch, myCounters);
-		}
-		else if (branch->dripLeafCooldown <= 0 && (rand() % 3) == 0) {
-			struct Branch newBranch = {
-				.x = branch->x,
-				.y = branch->y,
-				.type = dying,
-				.life = 5,
-				.age = 0,
-				.totalLife = 5,
-				.multiplier = branch->multiplier,
-				.shootCooldown = conf->multiplier,
-				.dripLeafCooldown = (branch->multiplier*2)/3,
-				.leaf_seed = rand(),
-				.history_count = 0,
-				.history_index = 0,
-				.x_history[0] = branch->x,
-				.y_history[0] = branch->y
-			};
-			addBranch(list, newBranch, myCounters);
-			branch->dripLeafCooldown = 7+ (25 + branch->multiplier);
-		}
-	}
-	// dying trunk should branch into a lot of leaves
-	else if (branch->type == trunk && branch->life < (branch->multiplier + 2)) {
-		struct Branch newBranch = {
-			.x = branch->x,
-			.y = branch->y,
-			.type = dying,
-			.life = branch->life,
-			.age = 0,
-			.totalLife = branch->life,
-			.multiplier = branch->multiplier,
-			.shootCooldown = conf->multiplier,
-			.dripLeafCooldown = branch->life / 4,
-			.leaf_seed = rand(),
-			.history_count = 0,
-			.history_index = 0,
-			.x_history[0] = branch->x,
-			.y_history[0] = branch->y
-		};
-		addBranch(list, newBranch, myCounters);
-	}
-	// dying shoot should branch into a lot of leaves
-	else if ((branch->type == shootLeft || branch->type == shootRight) && 
-			 branch->life < (branch->multiplier + 2)) {
-		struct Branch newBranch = {
-			.x = branch->x,
-			.y = branch->y,
-			.type = dying,
-			.life = branch->life,
-			.age = 0,
-			.totalLife = branch->life,
-			.multiplier = branch->multiplier,
-			.shootCooldown = conf->multiplier,
-			.dripLeafCooldown = branch->life / 4,
-			.leaf_seed = rand(),
-			.history_count = 0,
-			.history_index = 0,
-			.x_history[0] = branch->x,
-			.y_history[0] = branch->y
-		};
-		addBranch(list, newBranch, myCounters);
-	}
-	else if (branch->type == trunk) {
-		// First check for trunk splits - only in early phase and with enough life
-		if (!isYoungTrunk(branch->age, branch->totalLife)) {
-			int splitThreshold = (24 - branch->multiplier) + (2 * myCounters->trunks);
-			double ageRatio = (double)branch->age / branch->totalLife;
-
-			if (ageRatio < 0.1) {      // Bottom 10%
-				splitThreshold = (splitThreshold * 2)/7;
-			} else if (ageRatio < 0.4) {
-				splitThreshold = (splitThreshold * 3)/7;
-			} else {
-				splitThreshold = (splitThreshold * 5)/7;
+		// Random die-off check - more likely on shoots
+		if (type == trunk) {
+			if (rand() % 66 == 0) {   // 2% chance for trunk
+				life -= (life/2);       // Lose 1/4 of life
 			}
-
-			if (rand() % splitThreshold == 0) {
-				myCounters->trunks++;
-				branch->shootCooldown = (25 - branch->multiplier)/4;
-				struct Branch newBranch = {
-					.x = branch->x,
-					.y = branch->y,
-					.type = trunk,
-					.life = branch->life - (rand() % 6),
-					.age = 0,
-					.totalLife = branch->life - (rand() % 6),
-					.multiplier = branch->multiplier,
-					.shootCooldown = conf->multiplier,
-					.dripLeafCooldown = branch->life / 4,
-					.leaf_seed = rand(),
-					.history_count = 0,
-					.history_index = 0,
-					.x_history[0] = branch->x,
-					.y_history[0] = branch->y
-				};
-				addBranch(list, newBranch, myCounters);
+		} else if (type == shootLeft || type == shootRight) {
+			if (rand() % 20 == 0) {    // 5% chance for shoots
+				life /= 2;              // Lose half of life
 			}
-			branch->life -= rand() % 3; // cost of sprouting
 		}
 
-		// Then check for regular branch shoots
-		int branchDice = getBranchRollThreshold(branch->age, branch->totalLife, branch->multiplier);
-		if (branch->shootCooldown <= 0 && (rand() % branchDice == 0)) {
-			branch->shootCooldown = myCounters->trunks + (25 - branch->multiplier)/6;
-			int shootLife = (branch->life + (rand() % branch->multiplier) - 2);
-			
-			myCounters->shoots++;
-			myCounters->shootCounter++;
-			if (conf->verbosity)
-				mvwprintw(objects->treeWin, 4, 5, "shoots: %02d", myCounters->shoots);
-			
-			struct Branch newBranch = {
-				.x = branch->x,
-				.y = branch->y,
-				.type = (enum branchType)((myCounters->shootCounter % 2) + 1),
-				.life = shootLife,
-				.age = 0,
-				.totalLife = shootLife,
-				.multiplier = branch->multiplier,
-				.shootCooldown = conf->multiplier,
-				.dripLeafCooldown = shootLife / 4,
-				.leaf_seed = rand(),
-				.history_count = 0,
-				.history_index = 0,
-				.x_history[0] = branch->x,
-				.y_history[0] = branch->y
-			};
-			addBranch(list, newBranch, myCounters);
-			
-			branch->life -= rand() % ((branch->totalLife - branch->age)/4); // cost of sprouting
+		age = conf->lifeStart - life;
+
+		setDeltas(type, life, conf->lifeStart, age, conf->multiplier, &dx, &dy);
+
+		int maxY = getmaxy(objects->treeWin);
+		if (dy > 0 && y > (maxY - 2)) dy--; // reduce dy if too close to the ground
+
+		// near-dead branch should branch into a lot of leaves
+		if (life < 6) 
+			branch(conf, objects, myCounters, y, x, dead, life);
+
+		else if (type == shootLeft || type == shootRight) {
+			//int leafThreshold = (conf->multiplier /3) + (conf->lifeStart / 12);
+			if (life < 7 + (conf->multiplier /5)) {
+				branch(conf, objects, myCounters, y, x, dying, life + 1);
+			}
+            else if (dripLeafCooldown <= 0 && (rand() % 7) == 0) {
+                branch(conf, objects, myCounters, y, x, dying, 5);
+                dripLeafCooldown = (conf->multiplier*2)/3;
+            }
 		}
+
+		// dying trunk should branch into a lot of leaves
+		else if (type == 0 && life < (conf->multiplier + 2))
+			branch(conf, objects, myCounters, y, x, dying, life);
+
+		// dying shoot should branch into a lot of leaves
+		else if ((type == shootLeft || type == shootRight) && life < (conf->multiplier + 2))
+			branch(conf, objects, myCounters, y, x, dying, life);
+
+		// trunks should re-branch if not close to ground AND either randomly, or upon every <multiplier> steps
+		/* else if (type == 0 && ( \ */
+		/* 		(rand() % (conf.multiplier)) == 0 || \ */
+		/* 		(life > conf.multiplier && life % conf.multiplier == 0) */
+		/* 		) ) { */
+		else if (type == trunk) {
+			// First check for trunk splits - only in early phase and with enough life
+			if (!isYoungTrunk(age, conf->lifeStart)) {
+				// More likely to split near the bottom
+
+				int splitThreshold = (24 - conf->multiplier) +  (2 * myCounters->trunks);
+				double ageRatio = (double)age / conf->lifeStart;
+
+				if (ageRatio < 0.1) {      // Bottom 10%
+					splitThreshold = (splitThreshold * 2)/7;
+				} else if (ageRatio < 0.4) {
+					splitThreshold = (splitThreshold * 3)/7;
+				} else {
+                    splitThreshold = (splitThreshold * 5)/7;
+                }
+
+                //splitThreshold += 2 * myCounters->trunks;
+
+				if (rand() % splitThreshold == 0) {
+                    myCounters->trunks++;
+					shootCooldown = (25 - conf->multiplier)/4;
+					branch(conf, objects, myCounters, y, x, trunk, life - (rand() % 6));
+				}
+
+                life -= rand() % 3; // cost of sprouting 
+			}
+			
+			// Then check for regular branch shoots
+			int branchDice = getBranchRollThreshold(age, conf->lifeStart, conf->multiplier);
+			if (shootCooldown <= 0 && (rand() % branchDice == 0)) {
+				shootCooldown = myCounters->trunks + (25 - conf->multiplier)/6;
+				int shootLife = (life + (rand() % conf->multiplier) - 2);
+				
+				myCounters->shoots++;
+				myCounters->shootCounter++;
+				if (conf->verbosity)
+					mvwprintw(objects->treeWin, 4, 5, "shoots: %02d", myCounters->shoots);
+					
+				branch(conf, objects, myCounters, y, x, 
+					(myCounters->shootCounter % 2) + 1, shootLife);
+				
+				life -= rand() % ((conf->lifeStart - age)/4); // cost of sprouting 
+			}
+		}
+		shootCooldown--;
+        dripLeafCooldown--;
+
+		if (conf->verbosity > 0) {
+			mvwprintw(objects->treeWin, 5, 5, "dx: %02d", dx);
+			mvwprintw(objects->treeWin, 6, 5, "dy: %02d", dy);
+			mvwprintw(objects->treeWin, 7, 5, "type: %d", type);
+			mvwprintw(objects->treeWin, 8, 5, "shootCooldown: % 3d", shootCooldown);
+		}
+
+		// move in x and y directions
+		x += dx;
+		y += dy;
+
+		chooseColor(type, objects->treeWin);
+
+		// choose string to use for this branch
+		char *branchStr = chooseString(conf, type, life, dx, dy);
+
+		// grab wide character from branchStr
+		wchar_t wc = 0;
+		mbstate_t *ps = 0;
+		mbrtowc(&wc, branchStr, 32, ps);
+
+		// print, but ensure wide characters don't overlap
+		if(x % wcwidth(wc) == 0)
+			mvwprintw(objects->treeWin, y, x, "%s", branchStr);
+
+		wattroff(objects->treeWin, A_BOLD);
+		free(branchStr);
+
+		// if live, update screen
+		// skip updating if we're still loading from file
+		if (conf->live && !(conf->load && myCounters->branches < conf->targetBranchCount))
+			updateScreen(conf->timeStep);
 	}
-	branch->shootCooldown--;
-	branch->dripLeafCooldown--;
-
-	if (conf->verbosity > 0) {
-		mvwprintw(objects->treeWin, 5, 5, "dx: %02d", branch->dx);
-		mvwprintw(objects->treeWin, 6, 5, "dy: %02d", branch->dy);
-		mvwprintw(objects->treeWin, 7, 5, "type: %d", branch->type);
-		mvwprintw(objects->treeWin, 8, 5, "shootCooldown: % 3d", branch->shootCooldown);
-		mvwprintw(objects->treeWin, 9, 5, "globalTime: %llu", myCounters->globalTime);
-	}
-
-	// move in x and y directions
-	branch->x += branch->dx;
-	branch->y += branch->dy;
-	if(conf->proceduralMode && branch->type != dying && branch->type != dead)
-		update_position_history(branch);
-
-	chooseColor(branch->type, objects->treeWin);
-
-	// choose string to use for this branch
-	char *branchStr = chooseString(conf, branch->type, branch->life, branch->dx, branch->dy);
-
-	// grab wide character from branchStr
-	wchar_t wc = 0;
-	mbstate_t *ps = 0;
-	mbrtowc(&wc, branchStr, 32, ps);
-
-	// print, but ensure wide characters don't overlap
-	if(branch->x % wcwidth(wc) == 0)
-		mvwprintw(objects->treeWin, branch->y, branch->x, "%s", branchStr);
-
-	wattroff(objects->treeWin, A_BOLD);
-	free(branchStr);
 }
 
 void addSpaces(WINDOW* messageWin, int count, int *linePosition, int maxWidth) {
@@ -978,218 +811,30 @@ void init(const struct config *conf, struct ncursesObjects *objects) {
 	drawMessage(conf, objects, conf->message);
 }
 
-WINDOW* duplicateWindow(WINDOW* source) {
-	int height, width, startx, starty;
-	getbegyx(source, starty, startx);
-	getmaxyx(source, height, width);
-	
-	WINDOW* duplicate = newwin(height, width, starty, startx);
-	
-	// Copy content and attributes
-	for (int y = 0; y < height; y++) {
-		for (int x = 0; x < width; x++) {
-			chtype ch = mvwinch(source, y, x);
-			mvwaddch(duplicate, y, x, ch);
-		}
-	}
-	
-	return duplicate;
-}
-
-// Simple recursive function to generate leaves at a position
-void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int x, int y, int life, unsigned int* leaf_seed) {
-	if (life <= 0) return;
-	life--;
-
-	int dx = 0, dy = 0, dice;
-	switch (type)
-	{
-	case 3: // dying: discourage vertical growth(?); trend left/right (-3,3)
-		dice = rand_r(leaf_seed) % 10;
-		if (dice >= 0 && dice <=0) dy = -1;
-		else if (dice >= 1 && dice <=8) dy = 0;
-		else if (dice >= 9 && dice <=9) dy = 1;
-
-		dice = rand_r(leaf_seed) % 15;
-		if (dice >= 0 && dice <=0) dx = -3;
-		else if (dice >= 1 && dice <= 2) dx = -2;
-		else if (dice >= 3 && dice <= 5) dx = -1;
-		else if (dice >= 6 && dice <= 8) dx = 0;
-		else if (dice >= 9 && dice <= 11) dx = 1;
-		else if (dice >= 12 && dice <= 13) dx = 2;
-		else if (dice >= 14 && dice <= 14) dx = 3;
-		break;
-
-	case 4: // dead: fill in surrounding area
-		dice = rand_r(leaf_seed) % 12;
-		if (dice >= 0 && dice <= 1) dy = -1;
-		else if (dice >= 2 && dice <= 8) dy = 0;
-		else if (dice >= 9 && dice <= 11) dy = 1;
-		
-		dice = rand_r(leaf_seed) % 15;
-		if (dice >= 0 && dice <=1) dx = -3;
-		else if (dice >= 2 && dice <= 3) dx = -2;
-		else if (dice >= 4 && dice <= 5) dx = -1;
-		else if (dice >= 6 && dice <= 8) dx = 0;
-		else if (dice >= 9 && dice <= 10) dx = 1;
-		else if (dice >= 11 && dice <= 12) dx = 2;
-		else if (dice >= 13 && dice <= 14) dx = 3;
-		break;
-	default:
-		break;
-	}
-
-	int maxY, maxX;
-	getmaxyx(win, maxY, maxX);
-	if (dy > 0 && y > (maxY - 2)) dy--;
-
-	generateLeaves(conf, win, type, x, y, life, leaf_seed); // more leaves
-
-	x += dx;
-	y += dy;
-
-	if (x >= 0 && x < maxX && y >= 0 && y < maxY) {
-
-		switch(type) 
-		{
-		case trunk:
-		case shootLeft:
-		case shootRight:
-			if (rand_r(leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(11));
-			else wattron(win, COLOR_PAIR(3));
-			break;
-
-		case dying:
-			if (rand_r(leaf_seed) % 10 == 0) wattron(win, A_BOLD | COLOR_PAIR(2));
-			else wattron(win, COLOR_PAIR(2));
-			break;
-
-		case dead:
-			if (rand_r(leaf_seed) % 3 == 0) wattron(win, A_BOLD | COLOR_PAIR(10));
-			else wattron(win, COLOR_PAIR(10));
-			break;
-		}
-
-		mvwprintw(win, y, x, "%s", conf->leaves[rand_r(leaf_seed) % conf->leavesSize]);
-	}
-}
-
 void growTree(struct config *conf, struct ncursesObjects *objects, struct counters *myCounters) {
+	// Clear the window at start
+    werase(objects->treeWin);
+
 	int maxY, maxX;
 	getmaxyx(objects->treeWin, maxY, maxX);
-	WINDOW* tempState = NULL;
-	PANEL* tempPanel = NULL;
 
-	if (conf->proceduralMode && conf->live) {
-		del_panel(objects->treePanel);
-		objects->treePanel = NULL;
-	}
+	// reset counters
+    myCounters->trunks = 0;
+	myCounters->shoots = 0;
+	myCounters->branches = 0;
+	myCounters->shootCounter = rand();
 
 	if (conf->verbosity > 0) {
 		mvwprintw(objects->treeWin, 2, 5, "maxX: %03d, maxY: %03d", maxX, maxY);
 	}
 
-	// Initialize branch list
-	struct BranchList branchList;
-	initBranchList(&branchList);
-
-	// reset counters
-	myCounters->trunks = 0;
-	myCounters->shoots = 0;
-	myCounters->branches = 0;
-	myCounters->shootCounter = 5;
-	myCounters->globalTime = 0;
-	
-	// Create initial trunk branch
-	struct Branch initialBranch = {
-		.x = maxX / 2,
-		.y = maxY - 1,
-		.life = conf->lifeStart,
-		.age = 0,
-		.type = trunk,
-		.shootCooldown = conf->multiplier,
-		.dripLeafCooldown = conf->multiplier + conf->lifeStart / 4,
-		.totalLife = conf->lifeStart,
-		.multiplier = conf->multiplier
-	};
-	addBranch(&branchList, initialBranch, myCounters);
-
-	// Main growth loop
-	int turn = 0;
-	while (branchList.count > 0) {
-
-		myCounters->globalTime++;
-
-		if (branchList.branches[turn].life <= 0) {
-			removeBranch(&branchList, turn);
-			if (turn >= branchList.count) {
-				turn = 0;
-			}
-			continue;
-		}
-
-		updateBranch(conf, objects, myCounters, &branchList.branches[turn], &branchList);
-		turn = (turn + 1) % branchList.count;
-		
-		if (conf->live && !(conf->load && myCounters->globalTime < conf->targetGlobalTime)) {
-			if (conf->proceduralMode) {
-				if (tempState == NULL) {
-					tempState = duplicateWindow(objects->treeWin);
-					tempPanel = new_panel(tempState);
-				} else {
-					werase(tempState);
-					overwrite(objects->treeWin, tempState);
-				}
-
-				for (int i = 0; i < branchList.count; i++) {
-					struct Branch* b = &branchList.branches[i];
-
-					double lifeRatio = ((double)b->age) / b->totalLife;
-
-					// Skip if branch is already dying/dead or not a main growth branch
-					if (b->type != trunk && b->type != shootLeft && b->type != shootRight) 
-						continue;
-
-					unsigned int leaf_seed = b->leaf_seed;
-
-					int avg_x, avg_y;
-					get_average_position(b, &avg_x, &avg_y);
-
-					int log_factor = 0, dummy = myCounters->globalTime;
-					while(dummy > 0) {
-						log_factor++;
-						dummy >>= 1;
-					}
-					// 7 + (conf->multiplier /5)
-					log_factor = (log_factor > 10) ? log_factor : log_factor << 1;
-
-					int leafLife = 4 + log_factor + lifeRatio * lifeRatio * ((b->type == trunk) ? 10 : 6);
-					enum branchType newType = (b->type == trunk) ? dead : dying;
-
-					generateLeaves(conf, tempState, newType, avg_x, avg_y, leafLife, &leaf_seed);
-				}
-			}
-			if (checkKeyPress(conf, myCounters) == 1) {
-				freeBranchList(&branchList);
-
-				if (tempState) {
-					del_panel(tempPanel);
-					delwin(tempState);
-				}
-				return;
-			}
-
-			updateScreen(conf->timeStep);
-		}
-	}
-	
-	freeBranchList(&branchList);
+	// recursively grow tree trunk and branches
+	branch(conf, objects, myCounters, maxY - 1, (maxX / 2), trunk, conf->lifeStart);
 
 	// display changes
 	update_panels();
 	doupdate();
 }
-
 
 // print stdscr to terminal window
 void printstdscr(void) {
@@ -1282,15 +927,14 @@ int main(int argc, char* argv[]) {
 		.screensaver = 0,
 		.printTree = 0,
 		.verbosity = 0,
-		.lifeStart = 120,
+		.lifeStart = 80,
 		.multiplier = 8,
 		.baseType = 1,
 		.seed = 0,
 		.leavesSize = 0,
 		.save = 0,
 		.load = 0,
-		.targetGlobalTime = 0,
-		.proceduralMode = 1,
+		.targetBranchCount = 0,
 
 		.timeWait = 4,
 		.timeStep = 0.03,
@@ -1316,7 +960,6 @@ int main(int argc, char* argv[]) {
 		{"seed", required_argument, NULL, 's'},
 		{"save", required_argument, NULL, 'W'},
 		{"load", required_argument, NULL, 'C'},
-		{"procedural", no_argument, NULL, 'P'},
 		{"verbose", no_argument, NULL, 'v'},
 		{"help", no_argument, NULL, 'h'},
 		{0, 0, 0, 0}
@@ -1329,7 +972,7 @@ int main(int argc, char* argv[]) {
 	// parse arguments
 	int option_index = 0;
 	int c;
-	while ((c = getopt_long(argc, argv, ":lt:iw:Sm:b:c:M:L:ps:C:W:vhP", long_options, &option_index)) != -1) {
+	while ((c = getopt_long(argc, argv, ":lt:iw:Sm:b:c:M:L:ps:C:W:vh", long_options, &option_index)) != -1) {
 		switch (c) {
 		case 'l':
 			conf.live = 1;
@@ -1412,9 +1055,6 @@ int main(int argc, char* argv[]) {
 			break;
 		case 'p':
 			conf.printTree = 1;
-			break;
-		case 'P':
-			conf.proceduralMode = 1;
 			break;
 		case 's':
 			if (strtold(optarg, NULL) != 0) conf.seed = strtod(optarg, NULL);
@@ -1508,7 +1148,7 @@ int main(int argc, char* argv[]) {
 	do {
 		init(&conf, &objects);
 		growTree(&conf, &objects, &myCounters);
-		if (conf.load) conf.targetGlobalTime = 0;
+		if (conf.load) conf.targetBranchCount = 0;
 		if (conf.infinite) {
 			timeout(conf.timeWait * 1000);
 			if (checkKeyPress(&conf, &myCounters) == 1)
