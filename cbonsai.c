@@ -1290,7 +1290,7 @@ int main(int argc, char* argv[]) {
 		.save = 0,
 		.load = 0,
 		.targetGlobalTime = 0,
-		.proceduralMode = 1,
+		.proceduralMode = 0,
 
 		.timeWait = 4,
 		.timeStep = 0.03,
