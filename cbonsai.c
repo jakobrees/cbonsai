@@ -602,6 +602,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 
 	// near-dead branch should branch into a lot of leaves
 	if (branch->life < 6) {
+
 		struct Branch newBranch = {
 			.x = branch->x,
 			.y = branch->y,
@@ -612,7 +613,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 			.multiplier = branch->multiplier,
 			.shootCooldown = conf->multiplier,
 			.dripLeafCooldown = branch->life / 4,
-			.leaf_seed = rand(),
+			.leaf_seed = branch->leaf_seed,
 			.history_count = 0,
 			.history_index = 0,
 			.x_history[0] = branch->x,
@@ -621,6 +622,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 		addBranch(list, newBranch, myCounters);
 	}
 	else if (branch->type == shootLeft || branch->type == shootRight) {
+
 		if (branch->life < 7 + (branch->multiplier /5)) {
 			struct Branch newBranch = {
 				.x = branch->x,
@@ -632,7 +634,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 				.multiplier = branch->multiplier,
 				.shootCooldown = conf->multiplier,
 				.dripLeafCooldown = (branch->life + 1) / 4,
-				.leaf_seed = rand(),
+				.leaf_seed = branch->leaf_seed,
 				.history_count = 0,
 				.history_index = 0,
 				.x_history[0] = branch->x,
@@ -663,6 +665,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 	}
 	// dying trunk should branch into a lot of leaves
 	else if (branch->type == trunk && branch->life < (branch->multiplier + 2)) {
+
 		struct Branch newBranch = {
 			.x = branch->x,
 			.y = branch->y,
@@ -684,6 +687,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 	// dying shoot should branch into a lot of leaves
 	else if ((branch->type == shootLeft || branch->type == shootRight) && 
 			 branch->life < (branch->multiplier + 2)) {
+
 		struct Branch newBranch = {
 			.x = branch->x,
 			.y = branch->y,
@@ -781,6 +785,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 		mvwprintw(objects->treeWin, 7, 5, "type: %d", branch->type);
 		mvwprintw(objects->treeWin, 8, 5, "shootCooldown: % 3d", branch->shootCooldown);
 		mvwprintw(objects->treeWin, 9, 5, "globalTime: %llu", myCounters->globalTime);
+		mvwprintw(objects->treeWin, 10, 5, "seed: %u", conf->seed);
 	}
 
 	// move in x and y directions
