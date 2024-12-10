@@ -43,7 +43,11 @@ struct config {
 	int leavesSize;
 	int save;
 	int load;
+
 	int proceduralMode;
+	int namedTree;           // Whether this is a named tree
+    time_t creationTime;     // When the tree was first created
+    double secondsPerTick;   // How many real seconds per simulation tick (-1 if not named)
 
 	double timeWait;
 	double timeStep;
@@ -52,6 +56,7 @@ struct config {
 	char* leaves[64];
 	char* saveFile;
 	char* loadFile;
+	int no_disp;
 };
 
 struct ncursesObjects {
@@ -101,7 +106,7 @@ void quit(struct config *conf, struct ncursesObjects *objects, int returnCode) {
 	exit(returnCode);
 }
 
-int saveToFile(char* fname, int seed, unsigned long long globalTime) {
+int saveToFile(char* fname, int seed, unsigned long long globalTime, time_t creationTime, double secondsPerTick) {
 	FILE *fp = fopen(fname, "w");
 
 	if (!fp) {
@@ -109,7 +114,7 @@ int saveToFile(char* fname, int seed, unsigned long long globalTime) {
 		return 1;
 	}
 
-	fprintf(fp, "%d %llu", seed, globalTime);
+	fprintf(fp, "%d %llu %ld %.6f", seed, globalTime, creationTime, secondsPerTick);
 	fclose(fp);
 
 	return 0;
@@ -125,17 +130,36 @@ int loadFromFile(struct config *conf) {
 	}
 
 	int seed;
-	unsigned long long targetGlobalTime;
-	if (fscanf(fp, "%i %llu", &seed, &targetGlobalTime) != 2) {
+	unsigned long long globalTime;
+	time_t creationTime;
+	double secondsPerTick;
+
+	if (fscanf(fp, "%i %llu %ld %lf", &seed, &globalTime, &creationTime, &secondsPerTick) != 4) {
 		printf("error: save file could not be read\n");
 		return 1;
 	}
 
 	conf->seed = seed;
-	conf->targetGlobalTime = targetGlobalTime;
+	conf->creationTime = creationTime;
+	conf->secondsPerTick = secondsPerTick;
+	conf->targetGlobalTime = globalTime;
+
+	// Calculate current target time based on elapsed real time
+	if (secondsPerTick > 0) {
+		time_t currentTime = time(NULL);
+		double elapsedSeconds = difftime(currentTime, creationTime);
+		conf->targetGlobalTime = (unsigned long long)(elapsedSeconds / secondsPerTick);
+		conf->timeStep = secondsPerTick;
+		conf->live = 1;
+		conf->proceduralMode = 1;
+		conf->printTree = 0;
+		conf->infinite = 0;
+		conf->load = 1;
+	} else {
+		conf->targetGlobalTime = globalTime;
+	}
 
 	fclose(fp);
-
 	return 0;
 }
 
@@ -144,7 +168,8 @@ void finish(const struct config *conf, struct counters *myCounters) {
 	refresh();
 	endwin();	// delete ncurses screen
 	if (conf->save)
-		saveToFile(conf->saveFile, conf->seed, myCounters->globalTime);
+		saveToFile(conf->saveFile, conf->seed, myCounters->globalTime, 
+				conf->creationTime, conf->secondsPerTick);
 }
 
 void printHelp(void) {
@@ -169,6 +194,10 @@ void printHelp(void) {
 			"                           for leaves\n"
 			"  -M, --multiplier=INT   branch multiplier; higher -> more\n"
 			"                           branching (0-20) [default: 8]\n"
+			"  -N, --name=TIME        create a named tree that grows over real time,\n"
+			"                           where TIME is life of tree in seconds.\n"
+			"                           MUST be used with -C to specify a save file.\n"
+			"                           (automatically enables -l and -P)\n"
 			"  -L, --life=INT         life; higher -> more growth (0-200) [default: 120]\n"
 			"  -p, --print            print tree to terminal when finished\n"
 			"  -s, --seed=INT         seed random number generator\n"
@@ -782,6 +811,10 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 		mvwprintw(objects->treeWin, 8, 5, "shootCooldown: % 3d", branch->shootCooldown);
 		mvwprintw(objects->treeWin, 9, 5, "globalTime: %llu", myCounters->globalTime);
 		mvwprintw(objects->treeWin, 10, 5, "seed: %u", conf->seed);
+		mvwprintw(objects->treeWin, 11, 5, "targetGlobalTime: %llu", conf->targetGlobalTime);
+		mvwprintw(objects->treeWin, 12, 5, "secondsPerTick: %.6f", conf->secondsPerTick);
+		mvwprintw(objects->treeWin, 13, 5, "timeStep: %.6f", conf->timeStep);
+		mvwprintw(objects->treeWin, 14, 5, "loadState: %d", conf->load ? 1 : 0);
 	}
 
 	// move in x and y directions
@@ -1077,6 +1110,23 @@ void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int 
 	}
 }
 
+int delayWithKeyCheck(const struct config *conf, struct counters *myCounters, float waitTime) {
+	const float CHECK_INTERVAL = 0.2;  // Check every 0.2 seconds
+	float remainingTime = waitTime;
+
+	while (remainingTime > 0) {
+		float sleepTime = (remainingTime > CHECK_INTERVAL) ? CHECK_INTERVAL : remainingTime;
+		updateScreen(sleepTime);
+		
+		if (checkKeyPress(conf, myCounters) == 1) {
+			return 1;  // Signal that we should quit
+		}
+		
+		remainingTime -= sleepTime;
+	}
+	return 0;
+}
+
 void growTree(struct config *conf, struct ncursesObjects *objects, struct counters *myCounters) {
 	int maxY, maxX;
 	getmaxyx(objects->treeWin, maxY, maxX);
@@ -1138,7 +1188,7 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 					dummy >>= 1;
 				}
 
-				int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 5 : 4);
+				int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
 				enum branchType newType = (b->type == trunk) ? dead : dying;
 
 				generateLeaves(conf, objects->treeWin, newType, avg_x, avg_y, leafLife, leaf_seed);
@@ -1183,7 +1233,7 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 						dummy >>= 1;
 					}
 
-					int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 5 : 4);
+					int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
 					enum branchType newType = (b->type == trunk) ? dead : dying;
 
 					generateLeaves(conf, tempState, newType, avg_x, avg_y, leafLife, leaf_seed);
@@ -1199,15 +1249,17 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 				return;
 			}
 
-			updateScreen(conf->timeStep);
+			if (!conf->no_disp && delayWithKeyCheck(conf, myCounters, conf->timeStep)) quit(conf, objects, 0);
 		}
 	}
 	
 	freeBranchList(&branchList);
 
 	// display changes
-	update_panels();
-	doupdate();
+	if (!conf->no_disp) {
+		update_panels();
+		doupdate();
+	}
 }
 
 // print stdscr to terminal window
@@ -1318,6 +1370,7 @@ int main(int argc, char* argv[]) {
 		.leaves = {0},
 		.saveFile = createDefaultCachePath(),
 		.loadFile = createDefaultCachePath(),
+		.no_disp = 0,
 	};
 
 	struct option long_options[] = {
@@ -1338,6 +1391,7 @@ int main(int argc, char* argv[]) {
 		{"procedural", no_argument, NULL, 'P'},
 		{"verbose", no_argument, NULL, 'v'},
 		{"help", no_argument, NULL, 'h'},
+		{"name", required_argument, NULL, 'N'},
 		{0, 0, 0, 0}
 	};
 
@@ -1348,7 +1402,8 @@ int main(int argc, char* argv[]) {
 	// parse arguments
 	int option_index = 0;
 	int c;
-	while ((c = getopt_long(argc, argv, ":lt:iw:Sm:b:c:M:L:ps:C:W:vhP", long_options, &option_index)) != -1) {
+	int real_save = 0;
+	while ((c = getopt_long(argc, argv, ":lt:iw:Sm:b:c:M:L:ps:C:W:vhPN:", long_options, &option_index)) != -1) {
 		switch (c) {
 		case 'l':
 			conf.live = 1;
@@ -1457,6 +1512,7 @@ int main(int argc, char* argv[]) {
 				conf.saveFile[bufsize - 1] = '\0';
 			}
 
+			real_save = 1;
 			conf.save = 1;
 			break;
 		case 'C':
@@ -1472,6 +1528,25 @@ int main(int argc, char* argv[]) {
 
 			conf.load = 1;
 			break;
+		case 'N':
+			conf.namedTree = 1;
+			conf.live = 1;               // Named trees are always live
+			conf.proceduralMode = 1;     // Named trees are always procedural
+			conf.save = 1;
+
+			// Parse the time argument
+			if (strtold(optarg, NULL) != 0) {
+				conf.secondsPerTick = strtod(optarg, NULL);												// not quite, rather simulate, later
+			} else {
+				printf("error: invalid seconds per tick: '%s'\n", optarg);
+				quit(&conf, &objects, 1);
+			}
+			if (conf.secondsPerTick <= 0) {
+				printf("error: seconds per tick must be positive: '%s'\n", optarg);
+				quit(&conf, &objects, 1);
+			}
+			break;
+
 		case 'v':
 			conf.verbosity++;
 			break;
@@ -1523,6 +1598,27 @@ int main(int argc, char* argv[]) {
 	srand(conf.seed);
 
 	struct counters myCounters;
+
+	if (conf.namedTree) {
+		if (!real_save) {
+			printf("error: named trees require specifying a save file with -W\n");
+			quit(&conf, &objects, 1);
+		}
+
+		// simulate actual time taken
+		double targetSec = conf.secondsPerTick;
+
+		init(&conf, &objects);
+		conf.timeStep = 0;
+		conf.no_disp = 1;
+		growTree(&conf, &objects, &myCounters);
+		conf.no_disp = 0;
+
+		conf.secondsPerTick = targetSec / myCounters.globalTime;
+		conf.timeStep = conf.secondsPerTick;
+		conf.creationTime = time(NULL);
+		srand(conf.seed);
+	}
 
 	do {
 		init(&conf, &objects);
