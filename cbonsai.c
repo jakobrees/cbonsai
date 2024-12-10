@@ -602,7 +602,6 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 
 	// near-dead branch should branch into a lot of leaves
 	if (branch->life < 6) {
-
 		struct Branch newBranch = {
 			.x = branch->x,
 			.y = branch->y,
@@ -613,7 +612,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 			.multiplier = branch->multiplier,
 			.shootCooldown = conf->multiplier,
 			.dripLeafCooldown = branch->life / 4,
-			.leaf_seed = branch->leaf_seed,
+			.leaf_seed = rand(),
 			.history_count = 0,
 			.history_index = 0,
 			.x_history[0] = branch->x,
@@ -622,7 +621,6 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 		addBranch(list, newBranch, myCounters);
 	}
 	else if (branch->type == shootLeft || branch->type == shootRight) {
-
 		if (branch->life < 7 + (branch->multiplier /5)) {
 			struct Branch newBranch = {
 				.x = branch->x,
@@ -634,7 +632,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 				.multiplier = branch->multiplier,
 				.shootCooldown = conf->multiplier,
 				.dripLeafCooldown = (branch->life + 1) / 4,
-				.leaf_seed = branch->leaf_seed,
+				.leaf_seed = rand(),
 				.history_count = 0,
 				.history_index = 0,
 				.x_history[0] = branch->x,
@@ -665,7 +663,6 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 	}
 	// dying trunk should branch into a lot of leaves
 	else if (branch->type == trunk && branch->life < (branch->multiplier + 2)) {
-
 		struct Branch newBranch = {
 			.x = branch->x,
 			.y = branch->y,
@@ -687,7 +684,6 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 	// dying shoot should branch into a lot of leaves
 	else if ((branch->type == shootLeft || branch->type == shootRight) && 
 			 branch->life < (branch->multiplier + 2)) {
-
 		struct Branch newBranch = {
 			.x = branch->x,
 			.y = branch->y,
@@ -1124,10 +1120,29 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 	// Main growth loop
 	int turn = 0;
 	while (branchList.count > 0) {
-
 		myCounters->globalTime++;
 
 		if (branchList.branches[turn].life <= 0) {
+			struct Branch* b = &branchList.branches[turn];
+			if (conf->proceduralMode &&
+				b->type != dying && b->type != dead) {
+				double lifeRatio = ((double)b->age) / b->totalLife;
+				unsigned int leaf_seed = b->leaf_seed;
+
+				int avg_x, avg_y;
+				get_average_position(b, &avg_x, &avg_y);
+
+				int log_factor = 0, dummy = b->age;
+				while(dummy > 0) {
+					log_factor++;
+					dummy >>= 1;
+				}
+
+				int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 5 : 4);
+				enum branchType newType = (b->type == trunk) ? dead : dying;
+
+				generateLeaves(conf, objects->treeWin, newType, avg_x, avg_y, leafLife, leaf_seed);
+			}
 			removeBranch(&branchList, turn);
 			if (turn >= branchList.count) {
 				turn = 0;
