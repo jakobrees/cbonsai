@@ -997,80 +997,82 @@ WINDOW* duplicateWindow(WINDOW* source) {
 }
 
 // Simple recursive function to generate leaves at a position
-void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int x, int y, int life, unsigned int* leaf_seed) {
-	if (life <= 0) return;
-	life--;
+void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int x, int y, int life, unsigned int leaf_seed) {
+	while (life > 0) {
+		if (life <= 0) return;
+		life--;
 
-	int dx = 0, dy = 0, dice;
-	switch (type)
-	{
-	case 3: // dying: discourage vertical growth(?); trend left/right (-3,3)
-		dice = rand_r(leaf_seed) % 10;
-		if (dice >= 0 && dice <=0) dy = -1;
-		else if (dice >= 1 && dice <=8) dy = 0;
-		else if (dice >= 9 && dice <=9) dy = 1;
-
-		dice = rand_r(leaf_seed) % 15;
-		if (dice >= 0 && dice <=0) dx = -3;
-		else if (dice >= 1 && dice <= 2) dx = -2;
-		else if (dice >= 3 && dice <= 5) dx = -1;
-		else if (dice >= 6 && dice <= 8) dx = 0;
-		else if (dice >= 9 && dice <= 11) dx = 1;
-		else if (dice >= 12 && dice <= 13) dx = 2;
-		else if (dice >= 14 && dice <= 14) dx = 3;
-		break;
-
-	case 4: // dead: fill in surrounding area
-		dice = rand_r(leaf_seed) % 12;
-		if (dice >= 0 && dice <= 1) dy = -1;
-		else if (dice >= 2 && dice <= 8) dy = 0;
-		else if (dice >= 9 && dice <= 11) dy = 1;
-		
-		dice = rand_r(leaf_seed) % 15;
-		if (dice >= 0 && dice <=1) dx = -3;
-		else if (dice >= 2 && dice <= 3) dx = -2;
-		else if (dice >= 4 && dice <= 5) dx = -1;
-		else if (dice >= 6 && dice <= 8) dx = 0;
-		else if (dice >= 9 && dice <= 10) dx = 1;
-		else if (dice >= 11 && dice <= 12) dx = 2;
-		else if (dice >= 13 && dice <= 14) dx = 3;
-		break;
-	default:
-		break;
-	}
-
-	int maxY, maxX;
-	getmaxyx(win, maxY, maxX);
-	if (dy > 0 && y > (maxY - 2)) dy--;
-
-	generateLeaves(conf, win, type, x, y, life, leaf_seed); // more leaves
-
-	x += dx;
-	y += dy;
-
-	if (x >= 0 && x < maxX && y >= 0 && y < maxY) {
-
-		switch(type) 
+		int dx = 0, dy = 0, dice;
+		switch (type)
 		{
-		case trunk:
-		case shootLeft:
-		case shootRight:
-			if (rand_r(leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(11));
-			else wattron(win, COLOR_PAIR(3));
+		case 3: // dying: discourage vertical growth(?); trend left/right (-3,3)
+			dice = rand_r(&leaf_seed) % 10;
+			if (dice >= 0 && dice <=0) dy = -1;
+			else if (dice >= 1 && dice <=8) dy = 0;
+			else if (dice >= 9 && dice <=9) dy = 1;
+
+			dice = rand_r(&leaf_seed) % 15;
+			if (dice >= 0 && dice <=0) dx = -3;
+			else if (dice >= 1 && dice <= 2) dx = -2;
+			else if (dice >= 3 && dice <= 5) dx = -1;
+			else if (dice >= 6 && dice <= 8) dx = 0;
+			else if (dice >= 9 && dice <= 11) dx = 1;
+			else if (dice >= 12 && dice <= 13) dx = 2;
+			else if (dice >= 14 && dice <= 14) dx = 3;
 			break;
 
-		case dying:
-			if (rand_r(leaf_seed) % 10 == 0) wattron(win, A_BOLD | COLOR_PAIR(2));
-			else wattron(win, COLOR_PAIR(2));
+		case 4: // dead: fill in surrounding area
+			dice = rand_r(&leaf_seed) % 12;
+			if (dice >= 0 && dice <= 1) dy = -1;
+			else if (dice >= 2 && dice <= 8) dy = 0;
+			else if (dice >= 9 && dice <= 11) dy = 1;
+			
+			dice = rand_r(&leaf_seed) % 15;
+			if (dice >= 0 && dice <=1) dx = -3;
+			else if (dice >= 2 && dice <= 3) dx = -2;
+			else if (dice >= 4 && dice <= 5) dx = -1;
+			else if (dice >= 6 && dice <= 8) dx = 0;
+			else if (dice >= 9 && dice <= 10) dx = 1;
+			else if (dice >= 11 && dice <= 12) dx = 2;
+			else if (dice >= 13 && dice <= 14) dx = 3;
 			break;
-
-		case dead:
-			if (rand_r(leaf_seed) % 3 == 0) wattron(win, A_BOLD | COLOR_PAIR(10));
-			else wattron(win, COLOR_PAIR(10));
+		default:
 			break;
 		}
 
-		mvwprintw(win, y, x, "%s", conf->leaves[rand_r(leaf_seed) % conf->leavesSize]);
+		int maxY, maxX;
+		getmaxyx(win, maxY, maxX);
+		if (dy > 0 && y > (maxY - 2)) dy--;
+
+		generateLeaves(conf, win, type, x, y, life, rand_r(&leaf_seed)); // more leaves
+
+		x += dx;
+		y += dy;
+
+		if (x >= 0 && x < maxX && y >= 0 && y < maxY) {
+
+			switch(type) 
+			{
+			case trunk:
+			case shootLeft:
+			case shootRight:
+				if (rand_r(&leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(11));
+				else wattron(win, COLOR_PAIR(3));
+				break;
+
+			case dying:
+				if (rand_r(&leaf_seed) % 10 == 0) wattron(win, A_BOLD | COLOR_PAIR(2));
+				else wattron(win, COLOR_PAIR(2));
+				break;
+
+			case dead:
+				if (rand_r(&leaf_seed) % 3 == 0) wattron(win, A_BOLD | COLOR_PAIR(10));
+				else wattron(win, COLOR_PAIR(10));
+				break;
+			}
+
+			mvwprintw(win, y, x, "%s", conf->leaves[rand_r(&leaf_seed) % conf->leavesSize]);
+		}
 	}
 }
 
@@ -1155,18 +1157,16 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 					int avg_x, avg_y;
 					get_average_position(b, &avg_x, &avg_y);
 
-					int log_factor = 0, dummy = myCounters->globalTime;
+					int log_factor = 0, dummy = b->age;
 					while(dummy > 0) {
 						log_factor++;
 						dummy >>= 1;
 					}
-					// 7 + (conf->multiplier /5)
-					log_factor = (log_factor > 10) ? log_factor : log_factor << 1;
 
-					int leafLife = 4 + log_factor + lifeRatio * lifeRatio * ((b->type == trunk) ? 10 : 6);
+					int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 5 : 4);
 					enum branchType newType = (b->type == trunk) ? dead : dying;
 
-					generateLeaves(conf, tempState, newType, avg_x, avg_y, leafLife, &leaf_seed);
+					generateLeaves(conf, tempState, newType, avg_x, avg_y, leafLife, leaf_seed);
 				}
 			}
 			if (checkKeyPress(conf, myCounters) == 1) {
@@ -1189,7 +1189,6 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 	update_panels();
 	doupdate();
 }
-
 
 // print stdscr to terminal window
 void printstdscr(void) {
@@ -1515,7 +1514,8 @@ int main(int argc, char* argv[]) {
 				quit(&conf, &objects, 0);
 
 			// seed random number generator
-			srand(time(NULL));
+			conf.seed = time(NULL);
+			srand(conf.seed);
 		}
 	} while (conf.infinite);
 
