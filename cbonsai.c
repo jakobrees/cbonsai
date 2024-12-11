@@ -1772,23 +1772,8 @@ int main(int argc, char* argv[]) {
 		}
 	} while (conf.infinite);
 
-	if (conf.printTree) {
-		finish(&conf, &myCounters);
-
-		init_pair(COLOR_YELLOW, 20, -1);  // Trunk color
-		init_pair(COLOR_GREEN, 22, -1);   // Main leaf color
-
-		// overlay all windows onto stdscr
-		overlay(objects.baseWin, stdscr);
-		overlay(objects.treeWin, stdscr);
-		overwrite(objects.messageBorderWin, stdscr);
-		overwrite(objects.messageWin, stdscr);
-
-		printstdscr();
-	} else {
-		wgetch(objects.treeWin);
-		finish(&conf, &myCounters);
-	}
+	wgetch(objects.treeWin);
+	finish(&conf, &myCounters);
 
 	quit(&conf, &objects, 0);
 }
