@@ -221,11 +221,11 @@ void drawBase(WINDOW* baseWin, int baseType) {
 	case 1:
 		wattron(baseWin, A_BOLD | COLOR_PAIR(8));
 		wprintw(baseWin, "%s", ":");
-		wattron(baseWin, COLOR_PAIR(2));
+		wattron(baseWin, COLOR_PAIR(23));
 		wprintw(baseWin, "%s", "__________");
-		wattron(baseWin, COLOR_PAIR(11));
+		wattron(baseWin, COLOR_PAIR(20));
 		wprintw(baseWin, "%s", "./~~~~\\.");
-		wattron(baseWin, COLOR_PAIR(2));
+		wattron(baseWin, COLOR_PAIR(23));
 		wprintw(baseWin, "%s", "___________");
 		wattron(baseWin, COLOR_PAIR(8));
 		wprintw(baseWin, "%s", ":");
@@ -314,24 +314,119 @@ void updateScreen(float timeStep) {
 	nanosleep(&ts, NULL);	// sleep for given time
 }
 
+// Helper function to interpolate between two color values
+static inline int interpolate_color(int color1, int color2, float ratio) {
+	return color2 * (1.0 - ratio) + color1 * ratio;
+	//return color1 + (int)((color2 - color1) * ratio);
+}
+
+// Structure to hold RGB values
+struct ColorRGB {
+	int r, g, b;
+	int r_2, g_2, b_2;
+};
+
+// Define season colors
+struct ColorRGB season_colors[5] = {
+	{.r=350, .g=800, .b=350,	// Spring: Light green
+	.r_2=500, .g_2=800, .b_2=500},
+	{.r=0, .g=700, .b=0,		// Summer: Deep green
+	.r_2=0, .g_2=520, .b_2=0},
+    {.r=1000, .g=900, .b=80,	// Early Fall: Yellow (short period)
+	.r_2=1000, .g_2=600, .b_2=80},
+	{.r=900, .g=100, .b=100,	// Late Fall: Deep red (Japanese maple)
+	.r_2=450, .g_2=50, .b_2=50},
+	{.r=900, .g=900, .b=900,	// Winter: White
+	.r_2=750, .g_2=750, .b_2=750}
+};
+
+enum Season {
+    SPRING,
+    SUMMER,
+    EARLY_FALL,
+    LATE_FALL,
+    WINTER
+};
+
+enum Season get_current_season_with_blend(float *blend_ratio) {
+	time_t now = time(NULL);
+	struct tm *local_time = localtime(&now);
+
+	// Get day of year (0-365)
+	int day_of_year = local_time->tm_yday;
+
+	// Define season transitions (days of year)
+	const int spring_start = 20;
+	const int summer_start = 100;
+	const int fall_start = 220;
+	const int fall_late = 260;
+	const int winter_start = 320;
+
+	// Transition period (2 weeks = 14 days)
+	int blend_period = 0;
+
+	// Calculate current season and blend ratio
+	enum Season current_season;
+	int days_into_transition = 0;
+
+	if (day_of_year >= winter_start || day_of_year < spring_start) {
+		current_season = WINTER;
+		blend_period = 10;
+		if (day_of_year >= winter_start) {
+			days_into_transition = day_of_year - winter_start;
+		} else {
+			days_into_transition = (365 - winter_start) + day_of_year;
+		}
+	} else if (day_of_year >= fall_start && day_of_year < fall_late) {
+		current_season = EARLY_FALL;
+		blend_period = 40;
+		days_into_transition = day_of_year - fall_start;
+	} else if (day_of_year >= fall_late) {
+		current_season = LATE_FALL;
+		blend_period = 25;
+		days_into_transition = day_of_year - fall_late;
+	} else if (day_of_year >= summer_start) {
+		current_season = SUMMER;
+		blend_period = 20;
+		days_into_transition = day_of_year - summer_start;
+	} else {
+		current_season = SPRING;
+		blend_period = 10;
+		days_into_transition = day_of_year - spring_start;
+	}
+
+	if (((float)days_into_transition) / blend_period < 1.0f)
+        *blend_ratio = ((float) days_into_transition) / blend_period;
+    else *blend_ratio = 1.0;
+    return current_season;
+}
+
 // based on type of tree, determine what color a branch should be
 void chooseColor(enum branchType type, WINDOW* treeWin) {
 	switch(type) {
 	case trunk:
+		if (rand() % 2 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(20));
+		else if (rand() % 2 == 0) wattron(treeWin, COLOR_PAIR(20));
+		else wattron(treeWin, COLOR_PAIR(21));
+		break;
+
 	case shootLeft:
 	case shootRight:
-		if (rand() % 2 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(11));
-		else wattron(treeWin, COLOR_PAIR(3));
+		if (rand() % 5 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(20));
+		else if (rand() % 2 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(21));
+		else wattron(treeWin, COLOR_PAIR(21));
 		break;
 
 	case dying:
-		if (rand() % 10 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(2));
-		else wattron(treeWin, COLOR_PAIR(2));
+		if (rand() % 2 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
+		else if (rand() % 3 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
+		else wattron(treeWin, COLOR_PAIR(23));
 		break;
 
 	case dead:
-		if (rand() % 3 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(10));
-		else wattron(treeWin, COLOR_PAIR(10));
+		if (rand() % 6 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(23));
+		else if (rand() % 3 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
+		else wattron(treeWin, COLOR_PAIR(22));
 		break;
 	}
 }
@@ -986,19 +1081,50 @@ void init(const struct config *conf, struct ncursesObjects *objects) {
 	cbreak();	// don't wait for new line to grab user input
 	nodelay(stdscr, TRUE);	// force getch to be a non-blocking call
 
+	// use native background color when possible
+	int bg = COLOR_BLACK;
+	if (use_default_colors() != ERR) bg = -1;
+
 	// if terminal has color capabilities, use them
 	if (has_colors()) {
 		start_color();
-
-		// use native background color when possible
-		int bg = COLOR_BLACK;
-		if (use_default_colors() != ERR) bg = -1;
 
 		// define color pairs
 		for(int i=0; i<16; i++){
 			init_pair(i, i, bg);
 		}
 
+		float blend_ratio;
+		enum Season season = get_current_season_with_blend(&blend_ratio);
+		
+		// Get current and next season colors
+		struct ColorRGB current_colors = season_colors[season];
+		struct ColorRGB prev_colors = season_colors[(season + 4) % 5];
+		
+		// Interpolate between seasons
+		int r = interpolate_color(current_colors.r, prev_colors.r, blend_ratio);
+		int g = interpolate_color(current_colors.g, prev_colors.g, blend_ratio);
+		int b = interpolate_color(current_colors.b, prev_colors.b, blend_ratio);
+		int r_2 = interpolate_color(current_colors.r_2, prev_colors.r_2, blend_ratio);
+		int g_2 = interpolate_color(current_colors.g_2, prev_colors.g_2, blend_ratio);
+		int b_2 = interpolate_color(current_colors.b_2, prev_colors.b_2, blend_ratio);
+		
+		init_color(16, 540, 270, 0);    // Lighter brown for trunk
+		init_color(17, 280, 140, 0);    // Darker brown for branches
+		init_color(18, r, g, b);  		// Main leaf color
+		init_color(19, r_2, g_2, b_2);  // Darker variant
+
+        init_pair(20, 16, bg);  // Trunk color 		(darker)
+        init_pair(21, 17, bg); 	// branch color 	(lighter)
+		init_pair(22, 18, bg);  // Leaf color 1		trunk-leaf
+        init_pair(23, 19, bg); 	// Leaf color 2		branch-leaf
+
+		if (can_change_color() == FALSE) {
+			if (conf->verbosity > 0) {
+				mvwprintw(objects->treeWin, 15, 5, "Terminal cannot change colors");
+			}
+		}
+		
 		// restrict color pallete in non-256color terminals (e.g. screen or linux)
 		if (COLORS < 256) {
 			init_pair(8, 7, bg);	// gray will look white
@@ -1012,6 +1138,11 @@ void init(const struct config *conf, struct ncursesObjects *objects) {
 		}
 	} else {
 		printf("%s", "Warning: terminal does not have color support.\n");
+		// Terminal doesn't support changing colors, fallback to basic colors
+        init_pair(20, COLOR_YELLOW, bg);  // Trunk color
+        init_pair(21, COLOR_YELLOW, bg);  // Branch color
+        init_pair(22, COLOR_GREEN, bg);   // Main leaf color
+        init_pair(23, COLOR_GREEN, bg);   // Secondary leaf color
 	}
 
 	// define and draw windows, then create panels
@@ -1097,18 +1228,17 @@ void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int 
 			case trunk:
 			case shootLeft:
 			case shootRight:
-				if (rand_r(&leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(11));
-				else wattron(win, COLOR_PAIR(3));
 				break;
-
 			case dying:
-				if (rand_r(&leaf_seed) % 10 == 0) wattron(win, A_BOLD | COLOR_PAIR(2));
-				else wattron(win, COLOR_PAIR(2));
+				if (rand_r(&leaf_seed) % 3 == 0) wattron(win, COLOR_PAIR(22));
+				else if (rand_r(&leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(23));
+				else wattron(win, COLOR_PAIR(23));
 				break;
 
 			case dead:
-				if (rand_r(&leaf_seed) % 3 == 0) wattron(win, A_BOLD | COLOR_PAIR(10));
-				else wattron(win, COLOR_PAIR(10));
+				if (rand_r(&leaf_seed) % 3 == 0) wattron(win, A_BOLD | COLOR_PAIR(23));
+				else if (rand_r(&leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(22));
+				else wattron(win, COLOR_PAIR(22));
 				break;
 			}
 
@@ -1644,6 +1774,9 @@ int main(int argc, char* argv[]) {
 
 	if (conf.printTree) {
 		finish(&conf, &myCounters);
+
+		init_pair(COLOR_YELLOW, 20, -1);  // Trunk color
+		init_pair(COLOR_GREEN, 22, -1);   // Main leaf color
 
 		// overlay all windows onto stdscr
 		overlay(objects.baseWin, stdscr);
