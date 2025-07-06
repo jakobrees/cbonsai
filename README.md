@@ -171,7 +171,7 @@ echo "cbonsai -p" >> ~/.bashrc
 
 ## How it Works
 
-This enhanced version uses a sophisticated iterative growth algorithm instead of simple recursion (yes, potentially ruining the source  code elegance, however commpensating through visual intuitiveness). Key improvements include:
+This enhanced version uses a sophisticated iterative growth algorithm instead of simple recursion (yes, potentially ruining the source  code's elegance; commpensating with visual intuitiveness). Key improvements include:
 
 - **Dynamic Branch Management**: Branches are managed in a dynamic list with individual lifecycles
 - **Position History Tracking**: Each branch maintains a history of positions for realistic leaf placement
