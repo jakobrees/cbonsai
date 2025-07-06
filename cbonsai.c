@@ -14,24 +14,6 @@
 #include <unistd.h>
 #include <errno.h>
 
-/*
-
-
-sudo env PKG_CONFIG_PATH="/opt/homebrew/opt/ncurses/lib/pkgconfig" \
-LDFLAGS="-L/opt/homebrew/opt/ncurses/lib" \
-CPPFLAGS="-I/opt/homebrew/opt/ncurses/include" \
-make install
-
-cbonsai -N 63113904 -L 200 -M 10 -W "/Users/jakobrees/desktop/projects/cbonsai/kati_tree" -s 1733850059 -v
-cbonsai -N 63113904 -L 200 -M 10 -W "/Users/jakobrees/desktop/projects/cbonsai/caspi_tree" -s 1733850115 -v
-cbonsai -N 63113904 -L 200 -M 10 -W "/Users/jakobrees/desktop/projects/cbonsai/tobi_tree" -s 1733850054 -v 
-
-cbonsai -L 200 -M 10 -C "/Users/jakobrees/desktop/projects/cbonsai/kati_tree"
-cbonsai -L 200 -M 10 -C "/Users/jakobrees/desktop/projects/cbonsai/caspi_tree"
-cbonsai -L 200 -M 10 -C "/Users/jakobrees/desktop/projects/cbonsai/tobi_tree"
-
-*/
-
 #define BRANCH_HISTORY 3 // moving average for proceedural leaves
 
 enum branchType {trunk, shootLeft, shootRight, dying, dead};
