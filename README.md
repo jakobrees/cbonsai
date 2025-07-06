@@ -6,14 +6,14 @@
 
 This version includes major enhancements and new features developed by Jakob Rees, building on the original foundation by John Allbritten.
 
-<img src="assets/cbonsai-demo.gif"  align="right" width="400px">
-
 <br>
 <br>
 <br>
 <br>
 
 ## Key Features
+
+<img src="assets/cbonsai-demo.gif"  align="right" width="400px">
 
 - **Seasonal Colors**: Trees automatically change colors based on the current date, transitioning through spring greens, summer depth, autumn yellows and reds, and winter whites
 - **Named Trees**: Create persistent trees that grow in real-time over days or weeks using the `-N` option
