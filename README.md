@@ -6,6 +6,8 @@
 
 This version includes major enhancements and new features developed by Jakob Rees, building on the original foundation by John Allbritten.
 
+<img src="assets/cbonsai-demo.gif"  align="right" width="400px">
+
 <br>
 <br>
 <br>
