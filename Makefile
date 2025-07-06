@@ -26,8 +26,9 @@ ifeq ($(OS),Darwin)
         PKG_CONFIG_PATH += :$(BREW_PREFIX)/opt/ncurses/lib/pkgconfig
         CPPFLAGS += -I$(BREW_PREFIX)/opt/ncurses/include
         LDFLAGS  += -L$(BREW_PREFIX)/opt/ncurses/lib
-        # macOS specific library flags
-        LDLIBS   += -lncurses -lpanel
+        # Use the full paths to the static libraries
+        LDLIBS   += $(BREW_PREFIX)/opt/ncurses/lib/libncurses.a \
+                    $(BREW_PREFIX)/opt/ncurses/lib/libpanel.a
     else
         $(error Homebrew not found. Please install Homebrew and ncurses)
     endif
@@ -35,6 +36,7 @@ else
     # Linux and other systems
     ifeq ($(shell $(PKG_CONFIG) --exists ncursesw panelw 2>/dev/null && echo 1),1)
         CFLAGS  += $(shell $(PKG_CONFIG) --cflags ncursesw panelw)
+		CFLAGS  += $(shell $(PKG_CONFIG) -static)
         LDLIBS  += $(shell $(PKG_CONFIG) --libs ncursesw panelw)
     else
         LDLIBS  += -lncursesw -ltinfo -lpanelw

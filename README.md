@@ -2,56 +2,39 @@
 
 <img src="https://i.imgur.com/rnqJx3P.gif" align="right" width="400px">
 
-`cbonsai` is a bonsai tree generator, written in `C` using `ncurses`. It intelligently creates, colors, and positions a bonsai tree, and is entirely configurable via CLI options-- see [usage](#usage). There are 2 modes of operation: `static` (see finished bonsai tree), and `live` (see growth step-by-step).
+`cbonsai` is an advanced bonsai tree generator, written in `C` using `ncurses`. It intelligently creates, colors, and positions bonsai trees with seasonal color changes, real-time growth, and advanced procedural generation. The trees are entirely configurable via CLI options and support multiple modes of operation including static display, live growth animation, and persistent real-time trees.
 
-`cbonsai` is always looking for ideas for improvement- feel free to open an issue if you've got an idea or a bug!
+This version includes major enhancements and new features developed by Jakob Rees, building on the original foundation by John Allbritten.
 
 <br>
 <br>
 <br>
 <br>
-<br>
-<br>
+
+## Key Features
+
+- **Seasonal Colors**: Trees automatically change colors based on the current date, transitioning through spring greens, summer depth, autumn yellows and reds, and winter whites
+- **Named Trees**: Create persistent trees that grow in real-time over days or weeks using the `-N` option
+- **Procedural Leaf Generation**: Advanced `-P` mode generates realistic leaf distributions using position history
+- **Message System**: Display custom messages with optional timeouts
+- **Enhanced Growth Algorithm**: Sophisticated branching logic with age-based behavior and trunk splitting
+- **Live Growth Animation**: Watch your tree grow step by step with customizable timing
+- **Save/Load System**: Persistent tree state with timestamp support for real-time growth
 
 ## Installation
 
-<a href="https://repology.org/project/cbonsai/versions">
-    <img src="https://repology.org/badge/vertical-allrepos/cbonsai.svg" alt="Packaging status" align="right">
-</a>
-
-`cbonsai` is available in multiple repositories. Check the repology chart to the right to see if `cbonsai` is packaged for your system. A big thank you to all the people who packaged `cbonsai`!
-
-If no package exists for your system/distribution, you'll have to use the [manual](https://gitlab.com/jallbrit/cbonsai#manual) install instructions. Below are some more specific instructions for some distributions.
-
-### Debian-based
-
-`cbonsai` is available in Debian Testing and Unstable via `apt`. Robin Gustafsson has also kindly packaged `cbonsai` as a `.deb` file over in [this repository](https://gitlab.com/rgson/debian_cbonsai/-/packages).
-
-### Fedora
-
-Mohammad Kefah has kindly packaged `cbonsai` in the [Fedora copr](https://copr.fedorainfracloud.org/), which is "similar to what the AUR is to Arch". On Fedora, it can be installed like so:
+### Quick Build (macOS with Homebrew)
 
 ```bash
-sudo dnf copr enable keefle/cbonsai
-sudo dnf install cbonsai
+gcc -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-qual -pedantic \
+    -I$(brew --prefix)/opt/ncurses/include \
+    -L$(brew --prefix)/opt/ncurses/lib \
+    cbonsai.c -o cbonsai \
+    $(brew --prefix)/opt/ncurses/lib/libncurses.a \
+    $(brew --prefix)/opt/ncurses/lib/libpanel.a
 ```
 
-### MacOS
-
-You may install `cbonsai` using [Homebrew](https://brew.sh):
-
-```bash
-brew install cbonsai
-```
-
-You may also install `cbonsai` using [MacPorts](https://www.macports.org). Simply install MacPorts, then issue the following commands:
-
-```bash
-sudo port selfupdate
-sudo port install cbonsai
-```
-
-### Manual
+### Manual Installation
 
 You'll need to have a working `ncursesw`/`ncurses` library.
 
@@ -59,38 +42,27 @@ You'll need to have a working `ncursesw`/`ncurses` library.
 
 ```bash
 sudo apt install libncursesw5-dev
+git clone [your-repo-url]
+cd cbonsai
+make install PREFIX=~/.local
 ```
 
 #### Fedora
 
 ```bash
-sudo dnf install ncursesw5-devel
+sudo dnf install ncurses-devel
+git clone [your-repo-url]
+cd cbonsai
+make install PREFIX=~/.local
 ```
 
 #### macOS
 
-Follow the [Manual](#manual) installation, but if you install `ncurses` via homebrew, you may see this:
-
-```
-For pkg-config to find ncurses you may need to set:
-  set -gx PKG_CONFIG_PATH "/usr/local/opt/ncurses/lib/pkgconfig"
-```
-
-You may need to follow these instructions before running `make install`.
-
-If you are having trouble installing on MacOS, try reading [this issue](https://gitlab.com/jallbrit/cbonsai/-/issues/10).
-
-Once dependencies are met, then install:
-
 ```bash
-git clone https://gitlab.com/jallbrit/cbonsai
+brew install ncurses
+git clone [your-repo-url]
 cd cbonsai
-
-# install for this user
-make install PREFIX=~/.local
-
-# install for all users
-sudo make install
+# Follow the Quick Build command above
 ```
 
 ## Usage
@@ -98,24 +70,30 @@ sudo make install
 ```
 Usage: cbonsai [OPTION]...
 
-cbonsai is a beautifully random bonsai tree generator.
+cbonsai is a beautifully random bonsai tree generator with seasonal colors and real-time growth.
 
 Options:
   -l, --live             live mode: show each step of growth
   -t, --time=TIME        in live mode, wait TIME secs between
                            steps of growth (must be larger than 0) [default: 0.03]
+  -P, --procedural       enable procedural leaf generation mode
   -i, --infinite         infinite mode: keep growing trees
   -w, --wait=TIME        in infinite mode, wait TIME between each tree
                            generation [default: 4.00]
-  -S, --screensaver      screensaver mode; equivalent to -liWC and
+  -S, --screensaver      screensaver mode; equivalent to -li and
                            quit on any keypress
   -m, --message=STR      attach message next to the tree
+  -T, --msgtime=SECS     clear message after SECS seconds
   -b, --base=INT         ascii-art plant base to use, 0 is none
   -c, --leaf=LIST        list of comma-delimited strings randomly chosen
                            for leaves
   -M, --multiplier=INT   branch multiplier; higher -> more
-                           branching (0-20) [default: 5]
-  -L, --life=INT         life; higher -> more growth (0-200) [default: 32]
+                           branching (0-20) [default: 8]
+  -N, --name=TIME        create a named tree that grows over real time,
+                           where TIME is life of tree in seconds.
+                           MUST be used with -W to specify a save file.
+                           (automatically enables -l and -P)
+  -L, --life=INT         life; higher -> more growth (0-200) [default: 120]
   -p, --print            print tree to terminal when finished
   -s, --seed=INT         seed random number generator
   -W, --save=FILE        save progress to file [default: ~/.cache/cbonsai]
@@ -124,49 +102,109 @@ Options:
   -h, --help             show help
 ```
 
-## Tips
+## Examples
+
+### Basic Usage
+
+```bash
+# Generate a simple tree
+cbonsai
+
+# Watch it grow with live animation
+cbonsai -l
+
+# Create a bigger, more complex tree
+cbonsai -L 200 -M 15 -l
+
+# Create a tree with a custom message
+cbonsai -m "Happy Birthday!" -T 10
+```
+
+### Named Trees (Real-time Growth)
+
+```bash
+# Create a tree that grows over 30 days (2,592,000 seconds)
+cbonsai -N 2592000 -W ~/my_tree
+
+# Load and continue growing your tree
+cbonsai -C ~/my_tree
+```
 
 ### Screensaver Mode
 
-Try out `-S/--screensaver` mode! As the help message states, it activates the `--live` and `--infinite` modes, quits upon any keypress, also saves/loads using the default cache file (`~/.cache/cbonsai`). This means:
-
-* When you start `cbonsai` with `--screensaver`, a tree (including its seed and progress) is loaded from the default cache file.
-* When you quit `cbonsai` and `--screensaver` was on, the current tree being generated (including its seed and progress) is written to the default cache file.
-
-This is helpful for a situations like the following: let's say you're growing a really big tree, really slowly:
-
 ```bash
-$ cbonsai --life 40 --multiplier 5 --time 20 --screensaver
+# Perfect for screensavers - saves/loads automatically
+cbonsai -S
 ```
 
-Normally, when you quite `cbonsai` (e.g. by you hitting `q` or `ctrl-c`), you would lose all progress on that tree. However, by specifying `--screensaver`, the tree is automatically saved to a cache file upon quitting. The next time you run that exact same screensaver command:
+## Advanced Features
 
+### Seasonal Colors
+Trees automatically display appropriate colors for the current season:
+- **Spring**: Light green growth
+- **Summer**: Deep, rich greens  
+- **Autumn**: Yellows transitioning to deep reds
+- **Winter**: Bare branches with white highlights
+
+### Procedural Leaf Generation
+When using `-P`, the algorithm tracks branch movement history to create more realistic leaf placement patterns.
+
+### Named Trees
+Named trees with `-N` create persistent trees that continue growing even when the program isn't running. Perfect for long-term displays or screensavers.
+
+## Tips
+
+### Long-term Growth
 ```bash
-$ cbonsai --life 40 --multiplier 5 --time 20 --screensaver
+# Start a tree that will grow over a month
+cbonsai -N 2592000 -L 200 -M 10 -W ~/garden/oak_tree -v
+
+# Check on it periodically
+cbonsai -C ~/garden/oak_tree
 ```
 
-The tree is automatically loaded from the cache file! And, since infinite mode is automatically turned on, it will finish the cached tree and just keep generating more. When you quit `cbonsai` again, the tree is once again written to the cache file for next time.
-
-Keep in mind that only the seed and number of branches are written to the cache file, so if you want to continue a previously generated tree, make sure you re-specify any other options you may have changed.
-
-### Add to `.bashrc`
-
-For a new bonsai tree every time you open a terminal, just add the following to the end of your `~/.bashrc`:
-
+### Add to Shell Profile
+For a new bonsai tree every time you open a terminal:
 ```bash
-cbonsai -p
+echo "cbonsai -p" >> ~/.bashrc
 ```
-
-Notice it uses the print mode, so that you can immediately start typing commands below the bonsai tree.
 
 ## How it Works
 
-`cbonsai` starts by drawing the base onto the screen, which is basically just a static string of characters. To generate the actual tree, `cbonsai` uses a ~~bunch of if statements~~ homemade algorithm to decide how the tree should grow every step. Shoots to the left and right are generated as the main trunk grows. As any branch dies, it branches out into a bunch of leaves.
+This enhanced version uses a sophisticated iterative growth algorithm instead of simple recursion. Key improvements include:
 
-`cbonsai` has rules for which character and color it should use for each tiny branch piece, depending on things like what type of branch it is and what direction it's facing.
+- **Dynamic Branch Management**: Branches are managed in a dynamic list with individual lifecycles
+- **Position History Tracking**: Each branch maintains a history of positions for realistic leaf placement
+- **Age-based Growth Patterns**: Different growth behaviors based on branch age and type
+- **Seasonal Color System**: Real-time color calculation based on current date with smooth transitions
+- **Persistent State**: Complex save/load system supporting real-time growth scenarios
 
-The algorithm is tweaked to look best at the default size, so larger sized trees may not be as bonsai-like.
+The algorithm carefully balances realistic growth patterns with aesthetic appeal, using probability distributions that change based on branch age, type, and environmental factors.
 
-## Inspiration
+## Development
 
-This project wouldn't be here if it weren't for its *roots*! `cbonsai` is a newer version of [bonsai.sh](https://gitlab.com/jallbrit/bonsai.sh), which was written in `bash` and was itself a port of [this bonsai tree generator](https://avelican.github.io/bonsai/) written in `javascript`.
+### Major Enhancements by Jakob Rees:
+- Complete rewrite of the growth algorithm from recursive to iterative
+- Seasonal color system with date-based transitions
+- Named tree functionality with real-time growth
+- Procedural leaf generation with position history
+- Advanced branch lifecycle management
+- Enhanced save/load system with timestamps
+- Message timeout system
+- Improved color management and terminal compatibility
+
+### Original Foundation:
+Based on the original `cbonsai` by John Allbritten, which was itself inspired by earlier bonsai generators.
+
+## Contributing
+
+This project welcomes contributions! Feel free to open issues or submit pull requests.
+
+## License
+
+[Include your chosen license here]
+
+## Authors
+
+**Jakob Rees** - Major enhancements and algorithm improvements  
+**John Allbritten** - Original foundation and core concepts

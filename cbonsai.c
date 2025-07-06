@@ -56,6 +56,9 @@ struct config {
     time_t creationTime;     // When the tree was first created
     double secondsPerTick;   // How many real seconds per simulation tick (-1 if not named)
 
+	int messageTimeout;  // seconds before message disappears
+	time_t messageStartTime;  // when the message was first displayed
+
 	double timeWait;
 	double timeStep;
 
@@ -83,6 +86,7 @@ struct counters {
 	int branches;
 	int shoots;
 	int shootCounter;
+	int trunkSplitCooldown;
 	unsigned long long globalTime;
 };
 
@@ -196,6 +200,7 @@ void printHelp(void) {
 			"  -S, --screensaver      screensaver mode; equivalent to -li and\n"
 			"                           quit on any keypress\n"
 			"  -m, --message=STR      attach message next to the tree\n"
+			"  -T, --msgtime=SECS     clear message after SECS seconds\n"
 			"  -b, --base=INT         ascii-art plant base to use, 0 is none\n"
 			"  -c, --leaf=LIST        list of comma-delimited strings randomly chosen\n"
 			"                           for leaves\n"
@@ -403,29 +408,34 @@ enum Season get_current_season_with_blend(float *blend_ratio) {
 
 // based on type of tree, determine what color a branch should be
 void chooseColor(enum branchType type, WINDOW* treeWin) {
+	int r;
 	switch(type) {
 	case trunk:
-		if (rand() % 2 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(20));
-		else if (rand() % 2 == 0) wattron(treeWin, COLOR_PAIR(20));
-		else wattron(treeWin, COLOR_PAIR(21));
-		break;
+		r = rand() % 4;  // Get a number 0-3	
+		if (r < 2) wattron(treeWin, A_BOLD | COLOR_PAIR(20));      // 0,1 (50% chance)
+		else if (r == 2) wattron(treeWin, COLOR_PAIR(20));         // 2 (25% chance)
+		else wattron(treeWin, COLOR_PAIR(21));                     // 3 (25% chance)
+		break; 
 
 	case shootLeft:
 	case shootRight:
-		if (rand() % 5 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(20));
-		else if (rand() % 2 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(21));
+		r = rand() % 10;  // Get a number 0-9
+		if (r < 2) wattron(treeWin, A_BOLD | COLOR_PAIR(20));
+		else if (r < 6) wattron(treeWin, A_BOLD | COLOR_PAIR(21));
 		else wattron(treeWin, COLOR_PAIR(21));
 		break;
 
 	case dying:
-		if (rand() % 2 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
-		else if (rand() % 3 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
+		r = rand() % 6;  // Get a number 0-5
+		if (r < 3) wattron(treeWin, COLOR_PAIR(22));
+		else if (r < 5) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
 		else wattron(treeWin, COLOR_PAIR(23));
 		break;
 
 	case dead:
-		if (rand() % 6 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(23));
-		else if (rand() % 3 == 0) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
+		r = rand() % 18;  // Get a number 0-17
+		if (r < 2) wattron(treeWin, A_BOLD | COLOR_PAIR(23));
+		else if (r < 8) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
 		else wattron(treeWin, COLOR_PAIR(22));
 		break;
 	}
@@ -512,7 +522,7 @@ static inline void get_average_position(struct Branch* branch, int* avg_x, int* 
 
 // Check if we're in the early trunk phase (first 30% of life)
 static inline int isEarlyTrunk(int age, int totalLife) {
-	return age < (totalLife * 7 / 20);  // 35% of total life
+	return age < (totalLife * 14 / 20);  // 70% of total life
 }
 
 // Check if we're in the young trunk phase (first 15% of life)
@@ -535,8 +545,8 @@ void setDeltas(enum branchType type, int life, int totalLife, int age, int multi
 		}
 		// young trunk should grow wide]
 		else if (isYoungTrunk(age, totalLife)) {
-			// every (multiplier * 0.5) steps, raise tree to next level
-			if (age % (int) (multiplier * 0.5) == 0) dy = -1;
+			// every (multiplier * 0.6) steps, raise tree to next level
+			if (age % (int) (multiplier * 0.6) == 0) dy = -1;
 			else dy = 0;
 
 			roll(&dice, 10);
@@ -834,6 +844,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 		addBranch(list, newBranch, myCounters);
 	}
 	else if (branch->type == trunk) {
+		branch->life--;
 		// First check for trunk splits - only in early phase and with enough life
 		if (!isYoungTrunk(branch->age, branch->totalLife)) {
 			int splitThreshold = (24 - branch->multiplier) + (2 * myCounters->trunks);
@@ -847,7 +858,9 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 				splitThreshold = (splitThreshold * 5)/7;
 			}
 
-			if (rand() % splitThreshold == 0) {
+			if (myCounters->trunkSplitCooldown < 0 && rand() % splitThreshold == 0) {
+				myCounters->trunkSplitCooldown = 2 + ((22 - conf->multiplier)*3)/4 +
+					(int)(5 * ((double)branch->totalLife - branch->age)/branch->totalLife);
 				myCounters->trunks++;
 				branch->shootCooldown = (25 - branch->multiplier)/4;
 				struct Branch newBranch = {
@@ -867,15 +880,15 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 					.y_history[0] = branch->y
 				};
 				addBranch(list, newBranch, myCounters);
+				branch->life -= rand() % 1+ (int)(5 * ((double)branch->totalLife - branch->age)/branch->totalLife); // cost of splitting
 			}
-			branch->life -= rand() % 3; // cost of sprouting
 		}
 
 		// Then check for regular branch shoots
 		int branchDice = getBranchRollThreshold(branch->age, branch->totalLife, branch->multiplier);
 		if (branch->shootCooldown <= 0 && (rand() % branchDice == 0)) {
 			branch->shootCooldown = myCounters->trunks + (25 - branch->multiplier)/6;
-			int shootLife = (branch->life + (rand() % branch->multiplier) - 2);
+			int shootLife = ((branch->life * 3)/4 + (rand() % branch->multiplier) - 2);
 			
 			myCounters->shoots++;
 			myCounters->shootCounter++;
@@ -899,10 +912,11 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 				.y_history[0] = branch->y
 			};
 			addBranch(list, newBranch, myCounters);
-			
-			branch->life -= rand() % ((branch->totalLife - branch->age)/4); // cost of sprouting
+
+			branch->life -= rand() % 3; // cost of sprouting
 		}
 	}
+	myCounters->trunkSplitCooldown--;
 	branch->shootCooldown--;
 	branch->dripLeafCooldown--;
 
@@ -973,8 +987,8 @@ void createMessageWindows(struct ncursesObjects *objects, char* message) {
 	}
 
 	// create separate box for message border
-	objects->messageBorderWin = newwin(boxHeight + 2, boxWidth + 4, (maxY * 0.7) - 1, (maxX * 0.7) - 2);
-	objects->messageWin = newwin(boxHeight, boxWidth + 1, maxY * 0.7, maxX * 0.7);
+	objects->messageBorderWin = newwin(boxHeight + 2, boxWidth + 4, (maxY * 0.3) - 1, (maxX * 0.7) - 2);
+	objects->messageWin = newwin(boxHeight, boxWidth + 1, maxY * 0.3, maxX * 0.7);
 
 	// draw box
 	wattron(objects->messageBorderWin, COLOR_PAIR(8) | A_BOLD);
@@ -985,9 +999,10 @@ void createMessageWindows(struct ncursesObjects *objects, char* message) {
 	objects->messagePanel = new_panel(objects->messageWin);
 }
 
-int drawMessage(const struct config *conf, struct ncursesObjects *objects, char* message) {
+int drawMessage(struct config *conf, struct ncursesObjects *objects, char* message) {
 	if (!message) return 1;
 
+	conf->messageStartTime = time(NULL);  // Set start time when drawing message
 	createMessageWindows(objects, message);
 
 	int maxWidth = getmaxx(objects->messageWin) - 2;
@@ -1073,7 +1088,30 @@ int drawMessage(const struct config *conf, struct ncursesObjects *objects, char*
 	return 0;
 }
 
-void init(const struct config *conf, struct ncursesObjects *objects) {
+void clearMessage(struct ncursesObjects *objects) {
+	if (objects->messagePanel) {
+		del_panel(objects->messagePanel);
+		objects->messagePanel = NULL;
+	}
+	if (objects->messageBorderPanel) {
+		del_panel(objects->messageBorderPanel);
+		objects->messageBorderPanel = NULL;
+	}
+	if (objects->messageWin) {
+		delwin(objects->messageWin);
+		objects->messageWin = NULL;
+	}
+	if (objects->messageBorderWin) {
+		delwin(objects->messageBorderWin);
+		objects->messageBorderWin = NULL;
+	}
+
+	// Update display
+	update_panels();
+	doupdate();
+}
+
+void init(struct config *conf, struct ncursesObjects *objects) {
 	savetty();	// save terminal settings
 	initscr();	// init ncurses screen
 	noecho();	// don't echo input to screen
@@ -1230,15 +1268,15 @@ void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int 
 			case shootRight:
 				break;
 			case dying:
-				if (rand_r(&leaf_seed) % 3 == 0) wattron(win, COLOR_PAIR(22));
+				if (rand_r(&leaf_seed) % 6 == 0) wattron(win, COLOR_PAIR(22));
 				else if (rand_r(&leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(23));
 				else wattron(win, COLOR_PAIR(23));
 				break;
 
 			case dead:
-				if (rand_r(&leaf_seed) % 3 == 0) wattron(win, A_BOLD | COLOR_PAIR(23));
-				else if (rand_r(&leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(22));
-				else wattron(win, COLOR_PAIR(22));
+				if (rand_r(&leaf_seed) % 7 == 0) wattron(win, A_BOLD | COLOR_PAIR(22));
+				else if (rand_r(&leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(23));
+				else wattron(win, COLOR_PAIR(23));
 				break;
 			}
 
@@ -1247,12 +1285,22 @@ void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int 
 	}
 }
 
-int delayWithKeyCheck(const struct config *conf, struct counters *myCounters, float waitTime) {
+int delayWithKeyCheck(struct config *conf, struct counters *myCounters, struct ncursesObjects *objects, float waitTime) {
 	const float CHECK_INTERVAL = 0.2;  // Check every 0.2 seconds
 	float remainingTime = waitTime;
 
 	while (remainingTime > 0) {
 		float sleepTime = (remainingTime > CHECK_INTERVAL) ? CHECK_INTERVAL : remainingTime;
+
+		// Check if message should be cleared
+		if (conf->messageTimeout > 0 && conf->message != NULL && objects->messagePanel != NULL) {
+			time_t currentTime = time(NULL);
+			if (currentTime - conf->messageStartTime >= conf->messageTimeout) {
+				clearMessage(objects);
+				conf->message = NULL;  // Clear the message pointer
+			}
+		}
+
 		updateScreen(sleepTime);
 		
 		if (checkKeyPress(conf, myCounters) == 1) {
@@ -1289,6 +1337,7 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 	myCounters->branches = 0;
 	myCounters->shootCounter = 5;
 	myCounters->globalTime = 0;
+	myCounters->trunkSplitCooldown = 0;
 	
 	// Create initial trunk branch
 	struct Branch initialBranch = {
@@ -1303,6 +1352,32 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 		.multiplier = conf->multiplier
 	};
 	addBranch(&branchList, initialBranch, myCounters);
+
+	if (conf->live && conf->proceduralMode && tempState == NULL) {
+		tempState = duplicateWindow(objects->treeWin);
+		tempPanel = new_panel(tempState);
+
+		// If we have message windows, recreate them on top
+		if (objects->messageWin && objects->messageBorderWin) {
+			// Store current panels/windows
+			PANEL* oldMessagePanel = objects->messagePanel;
+			PANEL* oldBorderPanel = objects->messageBorderPanel;
+			WINDOW* messageWin = objects->messageWin;
+			WINDOW* borderWin = objects->messageBorderWin;
+			
+			// Create new panels for existing windows
+			objects->messagePanel = new_panel(messageWin);
+			objects->messageBorderPanel = new_panel(borderWin);
+			
+			// Delete old panels
+			del_panel(oldMessagePanel);
+			del_panel(oldBorderPanel);
+			
+			// Ensure message panels are on top
+			top_panel(objects->messageBorderPanel);
+			top_panel(objects->messagePanel);
+		}
+	}
 
 	// Main growth loop
 	int turn = 0;
@@ -1337,45 +1412,43 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 			continue;
 		}
 
+		// do the tree state update
 		updateBranch(conf, objects, myCounters, &branchList.branches[turn], &branchList);
+
+		if (conf->live && conf->proceduralMode) {
+			werase(tempState);
+			overwrite(objects->treeWin, tempState);
+
+			for (int i = 0; i < branchList.count; i++) {
+				struct Branch* b = &branchList.branches[i];
+
+				double lifeRatio = ((double)b->age) / b->totalLife;
+
+				// Skip if branch is already dying/dead or not a main growth branch
+				if (b->type != trunk && b->type != shootLeft && b->type != shootRight) 
+					continue;
+
+				unsigned int leaf_seed = b->leaf_seed;
+
+				int avg_x, avg_y;
+				get_average_position(b, &avg_x, &avg_y);
+
+				int log_factor = 0, dummy = b->age;
+				while(dummy > 0) {
+					log_factor++;
+					dummy >>= 1;
+				}
+
+				int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
+				enum branchType newType = (b->type == trunk) ? dead : dying;
+
+				generateLeaves(conf, tempState, newType, avg_x, avg_y, leafLife, leaf_seed);
+			}
+		}
+
 		turn = (turn + 1) % branchList.count;
 		
 		if (conf->live && !(conf->load && myCounters->globalTime < conf->targetGlobalTime)) {
-			if (conf->proceduralMode) {
-				if (tempState == NULL) {
-					tempState = duplicateWindow(objects->treeWin);
-					tempPanel = new_panel(tempState);
-				} else {
-					werase(tempState);
-					overwrite(objects->treeWin, tempState);
-				}
-
-				for (int i = 0; i < branchList.count; i++) {
-					struct Branch* b = &branchList.branches[i];
-
-					double lifeRatio = ((double)b->age) / b->totalLife;
-
-					// Skip if branch is already dying/dead or not a main growth branch
-					if (b->type != trunk && b->type != shootLeft && b->type != shootRight) 
-						continue;
-
-					unsigned int leaf_seed = b->leaf_seed;
-
-					int avg_x, avg_y;
-					get_average_position(b, &avg_x, &avg_y);
-
-					int log_factor = 0, dummy = b->age;
-					while(dummy > 0) {
-						log_factor++;
-						dummy >>= 1;
-					}
-
-					int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
-					enum branchType newType = (b->type == trunk) ? dead : dying;
-
-					generateLeaves(conf, tempState, newType, avg_x, avg_y, leafLife, leaf_seed);
-				}
-			}
 			if (checkKeyPress(conf, myCounters) == 1) {
 				freeBranchList(&branchList);
 
@@ -1386,7 +1459,7 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 				return;
 			}
 
-			if (!conf->no_disp && delayWithKeyCheck(conf, myCounters, conf->timeStep)) quit(conf, objects, 0);
+			if (!conf->no_disp && delayWithKeyCheck(conf, myCounters, objects, conf->timeStep)) quit(conf, objects, 0);
 		}
 	}
 	
@@ -1503,6 +1576,9 @@ int main(int argc, char* argv[]) {
 		.timeWait = 4,
 		.timeStep = 0.03,
 
+		.messageStartTime = 0,
+		.messageTimeout = -1,
+
 		.message = NULL,
 		.leaves = {0},
 		.saveFile = createDefaultCachePath(),
@@ -1517,6 +1593,7 @@ int main(int argc, char* argv[]) {
 		{"wait", required_argument, NULL, 'w'},
 		{"screensaver", no_argument, NULL, 'S'},
 		{"message", required_argument, NULL, 'm'},
+		{"msgtime", required_argument, NULL, 'T'},
 		{"base", required_argument, NULL, 'b'},
 		{"leaf", required_argument, NULL, 'c'},
 		{"multiplier", required_argument, NULL, 'M'},
@@ -1534,13 +1611,13 @@ int main(int argc, char* argv[]) {
 
 	struct ncursesObjects objects = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 
-	char leavesInput[128] = "█,█,█,▒,▒,░";
+	char leavesInput[128] = "█,█,█,▒,▒";
 
 	// parse arguments
 	int option_index = 0;
 	int c;
 	int real_save = 0;
-	while ((c = getopt_long(argc, argv, ":lt:iw:Sm:b:c:M:L:ps:C:W:vhPN:", long_options, &option_index)) != -1) {
+	while ((c = getopt_long(argc, argv, ":lt:iw:Sm:b:c:M:L:ps:C:W:vhPN:T:", long_options, &option_index)) != -1) {
 		switch (c) {
 		case 'l':
 			conf.live = 1;
@@ -1553,6 +1630,17 @@ int main(int argc, char* argv[]) {
 			}
 			if (conf.timeStep < 0) {
 				printf("error: invalid step time: '%s'\n", optarg);
+				quit(&conf, &objects, 1);
+			}
+			break;
+		case 'T':
+			if (strtold(optarg, NULL) != 0) conf.messageTimeout = strtod(optarg, NULL);
+			else {
+				printf("error: invalid message timeout: '%s'\n", optarg);
+				quit(&conf, &objects, 1);
+			}
+			if (conf.messageTimeout < 0) {
+				printf("error: invalid message timeout: '%s'\n", optarg);
 				quit(&conf, &objects, 1);
 			}
 			break;
