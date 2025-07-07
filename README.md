@@ -204,7 +204,7 @@ This project welcomes contributions! Feel free to open issues or submit pull req
 
 ## License
 
-[Include your chosen license here]
+GNU GENERAL PUBLIC LICENSE
 
 ## Authors
 
