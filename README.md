@@ -196,7 +196,7 @@ The algorithm carefully balances realistic growth patterns with aesthetic appeal
 - Improved color management and terminal compatibility
 
 ### Original Foundation:
-Based on the original `cbonsai` by John Allbritten, which was itself inspired by earlier bonsai generators.
+Based on the original `cbonsai` by John Allbritten, available at [gitlab.com/jallbrit/cbonsai](https://gitlab.com/jallbrit/cbonsai), which was itself inspired by earlier bonsai generators.
 
 ## Contributing
 
@@ -209,4 +209,4 @@ GNU GENERAL PUBLIC LICENSE
 ## Authors
 
 **Jakob Rees** - Major enhancements and algorithm improvements  
-**John Allbritten** - Original foundation and core concepts
+**John Allbritten** - Original foundation and core concepts ([original repo](https://gitlab.com/jallbrit/cbonsai))
