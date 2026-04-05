@@ -158,8 +158,8 @@ Named trees with `-N` create persistent trees that continue growing even when th
 
 ### Long-term Growth
 ```bash
-# Start a tree that will grow over a month
-cbonsai -N 2592000 -L 200 -M 10 -W ~/garden/oak_tree -v
+# Start a tree that will grow over a month ('-lP' for live growth, lest you wait a month till the tree finishes growing)
+cbonsai -N 2592000 -L 200 -M 10 -W ~/garden/oak_tree -lP
 
 # Check on it periodically
 cbonsai -C ~/garden/oak_tree

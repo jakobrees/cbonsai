@@ -1109,43 +1109,12 @@ void init(struct config *conf, struct ncursesObjects *objects) {
 	if (has_colors()) {
 		start_color();
 
-		// define color pairs
+		// define color pairs 0-15
 		for(int i=0; i<16; i++){
 			init_pair(i, i, bg);
 		}
 
-		float blend_ratio;
-		enum Season season = get_current_season_with_blend(&blend_ratio);
-		
-		// Get current and next season colors
-		struct ColorRGB current_colors = season_colors[season];
-		struct ColorRGB prev_colors = season_colors[(season + 4) % 5];
-		
-		// Interpolate between seasons
-		int r = interpolate_color(current_colors.r, prev_colors.r, blend_ratio);
-		int g = interpolate_color(current_colors.g, prev_colors.g, blend_ratio);
-		int b = interpolate_color(current_colors.b, prev_colors.b, blend_ratio);
-		int r_2 = interpolate_color(current_colors.r_2, prev_colors.r_2, blend_ratio);
-		int g_2 = interpolate_color(current_colors.g_2, prev_colors.g_2, blend_ratio);
-		int b_2 = interpolate_color(current_colors.b_2, prev_colors.b_2, blend_ratio);
-		
-		init_color(16, 540, 270, 0);    // Lighter brown for trunk
-		init_color(17, 280, 140, 0);    // Darker brown for branches
-		init_color(18, r, g, b);  		// Main leaf color
-		init_color(19, r_2, g_2, b_2);  // Darker variant
-
-        init_pair(20, 16, bg);  // Trunk color 		(darker)
-        init_pair(21, 17, bg); 	// branch color 	(lighter)
-		init_pair(22, 18, bg);  // Leaf color 1		trunk-leaf
-        init_pair(23, 19, bg); 	// Leaf color 2		branch-leaf
-
-		if (can_change_color() == FALSE) {
-			if (conf->verbosity > 0) {
-				mvwprintw(objects->treeWin, 15, 5, "Terminal cannot change colors");
-			}
-		}
-		
-		// restrict color pallete in non-256color terminals (e.g. screen or linux)
+		// restrict color palette in non-256color terminals (e.g. screen, cygwin, linux console)
 		if (COLORS < 256) {
 			init_pair(8, 7, bg);	// gray will look white
 			init_pair(9, 1, bg);
@@ -1156,14 +1125,69 @@ void init(struct config *conf, struct ncursesObjects *objects) {
 			init_pair(14, 6, bg);
 			init_pair(15, 7, bg);
 		}
-	} else {
-		printf("%s", "Warning: terminal does not have color support.\n");
-		// Terminal doesn't support changing colors, fallback to basic colors
-        init_pair(20, COLOR_YELLOW, bg);  // Trunk color
-        init_pair(21, COLOR_YELLOW, bg);  // Branch color
-        init_pair(22, COLOR_GREEN, bg);   // Main leaf color
-        init_pair(23, COLOR_GREEN, bg);   // Secondary leaf color
+
+		if (can_change_color() && COLORS >= 256) {
+			// Full 256-color terminal: define custom seasonal RGB colors
+			float blend_ratio;
+			enum Season season = get_current_season_with_blend(&blend_ratio);
+
+			struct ColorRGB current_colors = season_colors[season];
+			struct ColorRGB prev_colors = season_colors[(season + 4) % 5];
+
+			int r   = interpolate_color(current_colors.r,   prev_colors.r,   blend_ratio);
+			int g   = interpolate_color(current_colors.g,   prev_colors.g,   blend_ratio);
+			int b   = interpolate_color(current_colors.b,   prev_colors.b,   blend_ratio);
+			int r_2 = interpolate_color(current_colors.r_2, prev_colors.r_2, blend_ratio);
+			int g_2 = interpolate_color(current_colors.g_2, prev_colors.g_2, blend_ratio);
+			int b_2 = interpolate_color(current_colors.b_2, prev_colors.b_2, blend_ratio);
+
+			init_color(16, 540, 270, 0);     // Lighter brown for trunk
+			init_color(17, 280, 140, 0);     // Darker brown for branches
+			init_color(18, r,   g,   b);     // Main leaf color
+			init_color(19, r_2, g_2, b_2);  // Darker leaf variant
+
+			init_pair(20, 16, bg);  // Trunk color
+			init_pair(21, 17, bg);  // Branch color
+			init_pair(22, 18, bg);  // Leaf color 1
+			init_pair(23, 19, bg);  // Leaf color 2
+		} else {
+			// Limited terminal (cygwin, screen, linux console, ssh with basic TERM):
+			// fall back to the 8 standard colors, season-aware
+			float blend_ratio;
+			enum Season season = get_current_season_with_blend(&blend_ratio);
+
+			short trunk_color, leaf_color_1, leaf_color_2;
+			switch (season) {
+				case EARLY_FALL:
+					trunk_color  = COLOR_YELLOW;
+					leaf_color_1 = COLOR_YELLOW;
+					leaf_color_2 = COLOR_YELLOW;
+					break;
+				case LATE_FALL:
+					trunk_color  = COLOR_RED;
+					leaf_color_1 = COLOR_RED;
+					leaf_color_2 = COLOR_YELLOW;
+					break;
+				case WINTER:
+					trunk_color  = COLOR_WHITE;
+					leaf_color_1 = COLOR_WHITE;
+					leaf_color_2 = COLOR_WHITE;
+					break;
+				case SPRING:
+				case SUMMER:
+				default:
+					trunk_color  = COLOR_YELLOW;
+					leaf_color_1 = COLOR_GREEN;
+					leaf_color_2 = COLOR_GREEN;
+					break;
+			}
+			init_pair(20, trunk_color,  bg);
+			init_pair(21, trunk_color,  bg);
+			init_pair(22, leaf_color_1, bg);
+			init_pair(23, leaf_color_2, bg);
+		}
 	}
+	// else: no color support at all — pairs remain at defaults, tree renders in terminal's default color
 
 	// define and draw windows, then create panels
 	drawWins(conf->baseType, objects);
