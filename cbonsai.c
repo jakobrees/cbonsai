@@ -528,7 +528,9 @@ void setDeltas(enum branchType type, int life, int totalLife, int age, int multi
 		// young trunk should grow wide]
 		else if (isYoungTrunk(age, totalLife)) {
 			// every (multiplier * 0.6) steps, raise tree to next level
-			if (age % (int) (multiplier * 0.6) == 0) dy = -1;
+			int step = (int)(multiplier * 0.6);
+			if (step < 1) step = 1;
+			if (age % step == 0) dy = -1;
 			else dy = 0;
 
 			roll(&dice, 10);
@@ -540,7 +542,9 @@ void setDeltas(enum branchType type, int life, int totalLife, int age, int multi
 		}
 		else if (isEarlyTrunk(age, totalLife)) {
 			// every (multiplier * 0.3) steps, raise tree to next level
-			if (age % (int) (multiplier * 0.3) == 0) dy = -1;
+			int step = (int)(multiplier * 0.3);
+			if (step < 1) step = 1;
+			if (age % step == 0) dy = -1;
 			else dy = 0;
 
 			roll(&dice, 10);
@@ -932,7 +936,9 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 	mbrtowc(&wc, branchStr, 32, ps);
 
 	// print, but ensure wide characters don't overlap
-	if(branch->x % wcwidth(wc) == 0)
+	int w = wcwidth(wc);
+	if (w <= 0) w = 1;  // zero-width / non-printable / decode failure: treat as width 1
+	if(branch->x % w == 0)
 		mvwprintw(objects->treeWin, branch->y, branch->x, "%s", branchStr);
 
 	wattroff(objects->treeWin, A_BOLD);
@@ -1062,7 +1068,7 @@ int drawMessage(struct config *conf, struct ncursesObjects *objects, char* messa
 
 		if (conf->verbosity >= 2) {
 			updateScreen(1);
-			mvwprintw(objects->treeWin, 11, 5, "word buffer: |% 15s|", wordBuffer);
+			mvwprintw(objects->treeWin, 11, 5, "word buffer: |%15s|", wordBuffer);
 		}
 		if (thisChar == '\0') break;	// quit when we reach the end of the message
 		i++;
