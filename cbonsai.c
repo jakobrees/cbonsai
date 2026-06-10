@@ -1455,12 +1455,14 @@ static void leafStepWalkers(struct config *conf, struct VirtualGrid *grid,
 			dy--;
 
 		unsigned int child_seed = rand_r(&wk->seed);
-		if (*count >= *capacity) {
-			*capacity *= 2;
-			*walkers = realloc(*walkers, sizeof(struct LeafWalker) * (size_t)*capacity);
-			wk = &(*walkers)[w];
+		if (*count < 4096) {
+			if (*count >= *capacity) {
+				*capacity *= 2;
+				*walkers = realloc(*walkers, sizeof(struct LeafWalker) * (size_t)*capacity);
+				wk = &(*walkers)[w];
+			}
+			(*walkers)[(*count)++] = (struct LeafWalker){.x = wk->x, .y = wk->y, .seed = child_seed};
 		}
-		(*walkers)[(*count)++] = (struct LeafWalker){.x = wk->x, .y = wk->y, .seed = child_seed};
 
 		wk->x += dx;
 		wk->y += dy;
@@ -1588,7 +1590,8 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 		if (branchList.branches[turn].life <= 0) {
 			struct Branch* b = &branchList.branches[turn];
 			if (conf->proceduralMode &&
-				b->type != dying && b->type != dead) {
+				b->type != dying && b->type != dead &&
+				b->totalLife > 0) {
 				double lifeRatio = ((double)b->age) / b->totalLife;
 				unsigned int leaf_seed = b->leaf_seed;
 
@@ -1628,6 +1631,8 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 				struct Branch* b = &branchList.branches[i];
 
 				if (b->type != trunk && b->type != shootLeft && b->type != shootRight)
+					continue;
+				if (b->totalLife <= 0)
 					continue;
 
 				int avg_x, avg_y;
