@@ -570,7 +570,11 @@ struct ColorResult chooseColorResult(enum branchType type) {
 	return cr;
 }
 
-// New structures to add
+struct LeafWalker {
+	int x, y;
+	unsigned int seed;
+};
+
 struct Branch {
 	int x, y;                   // Current position
 	int dx, dy;                 // Current direction
@@ -590,6 +594,10 @@ struct Branch {
 	struct VirtualGrid *leafGrid;
 	int leaf_steps_drawn;
 	int leaf_cur_x, leaf_cur_y;
+
+	struct LeafWalker *walkers;
+	int walker_count;
+	int walker_capacity;
 };
 
 struct BranchList {
@@ -628,6 +636,7 @@ void removeBranch(struct BranchList* list, int index) {
 void freeBranchList(struct BranchList* list) {
 	for (int i = 0; i < list->count; i++) {
 		grid_destroy(list->branches[i].leafGrid);
+		free(list->branches[i].walkers);
 	}
 	free(list->branches);
 	list->branches = NULL;
@@ -641,9 +650,14 @@ typedef void (*updateBranchFn)(struct config *conf, struct VirtualGrid *skeleton
 typedef void (*generateLeavesFn)(struct config *conf, struct VirtualGrid *grid,
 	enum branchType type, int x, int y, int life, unsigned int leaf_seed);
 
+typedef void (*leafStepFn)(struct config *conf, struct VirtualGrid *grid,
+	enum branchType type,
+	struct LeafWalker **walkers, int *count, int *capacity);
+
 struct TreeEngine {
 	updateBranchFn updateBranch;
 	generateLeavesFn generateLeaves;
+	leafStepFn leafStep;
 };
 
 static inline void update_position_history(struct Branch* branch) {
@@ -1393,22 +1407,23 @@ void init(struct config *conf, struct ncursesObjects *objects) {
 	drawMessage(conf, objects, conf->message);
 }
 
-void generateLeaves_v1(struct config *conf, struct VirtualGrid *grid, enum branchType type, int x, int y, int life, unsigned int leaf_seed) {
-	while (life > 0) {
-		if (life <= 0) return;
-		life--;
+static void leafStepWalkers(struct config *conf, struct VirtualGrid *grid,
+							enum branchType type,
+							struct LeafWalker **walkers, int *count, int *capacity) {
+	int prev_count = *count;
+	for (int w = 0; w < prev_count; w++) {
+		struct LeafWalker *wk = &(*walkers)[w];
 
 		int dx = 0, dy = 0, dice;
-		switch (type)
-		{
-		case 3:
-			dice = rand_r(&leaf_seed) % 10;
-			if (dice >= 0 && dice <=0) dy = -1;
-			else if (dice >= 1 && dice <=8) dy = 0;
-			else if (dice >= 9 && dice <=9) dy = 1;
+		switch (type) {
+		case dying:
+			dice = rand_r(&wk->seed) % 10;
+			if (dice >= 0 && dice <= 0) dy = -1;
+			else if (dice >= 1 && dice <= 8) dy = 0;
+			else if (dice >= 9 && dice <= 9) dy = 1;
 
-			dice = rand_r(&leaf_seed) % 15;
-			if (dice >= 0 && dice <=0) dx = -3;
+			dice = rand_r(&wk->seed) % 15;
+			if (dice >= 0 && dice <= 0) dx = -3;
 			else if (dice >= 1 && dice <= 2) dx = -2;
 			else if (dice >= 3 && dice <= 5) dx = -1;
 			else if (dice >= 6 && dice <= 8) dx = 0;
@@ -1416,15 +1431,14 @@ void generateLeaves_v1(struct config *conf, struct VirtualGrid *grid, enum branc
 			else if (dice >= 12 && dice <= 13) dx = 2;
 			else if (dice >= 14 && dice <= 14) dx = 3;
 			break;
-
-		case 4:
-			dice = rand_r(&leaf_seed) % 12;
+		case dead:
+			dice = rand_r(&wk->seed) % 12;
 			if (dice >= 0 && dice <= 1) dy = -1;
 			else if (dice >= 2 && dice <= 8) dy = 0;
 			else if (dice >= 9 && dice <= 11) dy = 1;
 
-			dice = rand_r(&leaf_seed) % 15;
-			if (dice >= 0 && dice <=1) dx = -3;
+			dice = rand_r(&wk->seed) % 15;
+			if (dice >= 0 && dice <= 1) dx = -3;
 			else if (dice >= 2 && dice <= 3) dx = -2;
 			else if (dice >= 4 && dice <= 5) dx = -1;
 			else if (dice >= 6 && dice <= 8) dx = 0;
@@ -1436,33 +1450,49 @@ void generateLeaves_v1(struct config *conf, struct VirtualGrid *grid, enum branc
 			break;
 		}
 
-		generateLeaves_v1(conf, grid, type, x, y, life, rand_r(&leaf_seed));
+		unsigned int child_seed = rand_r(&wk->seed);
+		if (*count >= *capacity) {
+			*capacity *= 2;
+			*walkers = realloc(*walkers, sizeof(struct LeafWalker) * (size_t)*capacity);
+			wk = &(*walkers)[w];
+		}
+		(*walkers)[(*count)++] = (struct LeafWalker){.x = wk->x, .y = wk->y, .seed = child_seed};
 
-		x += dx;
-		y += dy;
+		wk->x += dx;
+		wk->y += dy;
 
 		attr_t la = 0;
 		short lc = 0;
-		switch(type)
-		{
-		case trunk:
-		case shootLeft:
-		case shootRight:
-			break;
+		switch (type) {
 		case dying:
-			if (rand_r(&leaf_seed) % 6 == 0) { lc = 22; }
-			else if (rand_r(&leaf_seed) % 2 == 0) { la = A_BOLD; lc = 23; }
+			if (rand_r(&wk->seed) % 6 == 0) { lc = 22; }
+			else if (rand_r(&wk->seed) % 2 == 0) { la = A_BOLD; lc = 23; }
 			else { lc = 23; }
 			break;
 		case dead:
-			if (rand_r(&leaf_seed) % 7 == 0) { la = A_BOLD; lc = 22; }
-			else if (rand_r(&leaf_seed) % 2 == 0) { la = A_BOLD; lc = 23; }
+			if (rand_r(&wk->seed) % 7 == 0) { la = A_BOLD; lc = 22; }
+			else if (rand_r(&wk->seed) % 2 == 0) { la = A_BOLD; lc = 23; }
 			else { lc = 23; }
+			break;
+		default:
 			break;
 		}
 
-		grid_put(grid, x, y, conf->leaves[rand_r(&leaf_seed) % conf->leavesSize], la, lc);
+		grid_put(grid, wk->x, wk->y, conf->leaves[rand_r(&wk->seed) % conf->leavesSize], la, lc);
 	}
+}
+
+void generateLeaves_v1(struct config *conf, struct VirtualGrid *grid, enum branchType type, int x, int y, int life, unsigned int leaf_seed) {
+	int capacity = 16;
+	int count = 1;
+	struct LeafWalker *walkers = malloc(sizeof(struct LeafWalker) * (size_t)capacity);
+	walkers[0] = (struct LeafWalker){.x = x, .y = y, .seed = leaf_seed};
+
+	for (int step = 0; step < life; step++) {
+		leafStepWalkers(conf, grid, type, &walkers, &count, &capacity);
+	}
+
+	free(walkers);
 }
 
 struct TreeEngine get_engine(int version) {
@@ -1472,6 +1502,7 @@ struct TreeEngine get_engine(int version) {
 	default:
 		engine.updateBranch = updateBranch_v1;
 		engine.generateLeaves = generateLeaves_v1;
+		engine.leafStep = leafStepWalkers;
 		break;
 	}
 	return engine;
@@ -1570,6 +1601,10 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 				engine.generateLeaves(conf, skeleton, newType, avg_x, avg_y, leafLife, leaf_seed);
 			}
 
+			free(b->walkers);
+			b->walkers = NULL;
+			b->walker_count = 0;
+			b->walker_capacity = 0;
 			grid_destroy(b->leafGrid);
 			b->leafGrid = NULL;
 
@@ -1589,8 +1624,6 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 				if (b->type != trunk && b->type != shootLeft && b->type != shootRight)
 					continue;
 
-				double lifeRatio = ((double)b->age) / b->totalLife;
-
 				int avg_x, avg_y;
 				get_average_position(b, &avg_x, &avg_y);
 
@@ -1600,24 +1633,38 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 					dummy >>= 1;
 				}
 
+				double lifeRatio = ((double)b->age) / b->totalLife;
 				int targetLeafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
 
-				if (targetLeafLife != b->leaf_steps_drawn || avg_x != b->leaf_cur_x || avg_y != b->leaf_cur_y) {
-					if (b->leafGrid) {
-						grid_clear(b->leafGrid);
-						b->leafGrid->anchor_x = avg_x - 20;
-						b->leafGrid->anchor_y = avg_y - 20;
-					} else {
-						b->leafGrid = grid_create(40, 40, avg_x - 20, avg_y - 20);
-					}
-
-					enum branchType newType = (b->type == trunk) ? dead : dying;
-
-					engine.generateLeaves(conf, b->leafGrid, newType, avg_x, avg_y, targetLeafLife, b->leaf_seed);
-
-					b->leaf_steps_drawn = targetLeafLife;
+				if (!b->walkers) {
+					b->walker_capacity = 16;
+					b->walker_count = 1;
+					b->walkers = malloc(sizeof(struct LeafWalker) * (size_t)b->walker_capacity);
+					b->walkers[0] = (struct LeafWalker){.x = avg_x, .y = avg_y, .seed = b->leaf_seed};
+					b->leaf_steps_drawn = 0;
 					b->leaf_cur_x = avg_x;
 					b->leaf_cur_y = avg_y;
+					b->leafGrid = grid_create(40, 40, avg_x - 20, avg_y - 20);
+				}
+
+				if (avg_x != b->leaf_cur_x || avg_y != b->leaf_cur_y) {
+					int delta_x = avg_x - b->leaf_cur_x;
+					int delta_y = avg_y - b->leaf_cur_y;
+					for (int w = 0; w < b->walker_count; w++) {
+						b->walkers[w].x += delta_x;
+						b->walkers[w].y += delta_y;
+					}
+					b->leafGrid->anchor_x += delta_x;
+					b->leafGrid->anchor_y += delta_y;
+					b->leaf_cur_x = avg_x;
+					b->leaf_cur_y = avg_y;
+				}
+
+				if (b->leaf_steps_drawn < targetLeafLife) {
+					enum branchType leafType = (b->type == trunk) ? dead : dying;
+					engine.leafStep(conf, b->leafGrid, leafType,
+									&b->walkers, &b->walker_count, &b->walker_capacity);
+					b->leaf_steps_drawn++;
 				}
 			}
 		}
