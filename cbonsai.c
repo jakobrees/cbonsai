@@ -14,8 +14,6 @@
 #include <unistd.h>
 #include <errno.h>
 
-FILE *debugLog = NULL;
-
 #define BRANCH_HISTORY 3 // moving average for proceedural leaves
 
 enum branchType {trunk, shootLeft, shootRight, dying, dead};
@@ -32,6 +30,7 @@ struct config {
 	int baseType;
 	int seed;
 	int leavesSize;
+	int version;
 	int save;
 	int load;
 
@@ -155,11 +154,6 @@ void grid_put(struct VirtualGrid *g, int tx, int ty, const char *str, attr_t att
 		lx = tx - g->anchor_x;
 		ly = ty - g->anchor_y;
 	}
-	if (debugLog && tx == 0 && ty == 0) {
-		fprintf(debugLog, "[GRID_PUT (0,0)] str='%s' cpair=%d lx=%d ly=%d anchor=(%d,%d)\n",
-			str, cpair, lx, ly, g->anchor_x, g->anchor_y);
-		fflush(debugLog);
-	}
 	struct GridCell *cell = &g->cells[ly * g->width + lx];
 	strncpy(cell->ch, str, sizeof(cell->ch) - 1);
 	cell->ch[sizeof(cell->ch) - 1] = '\0';
@@ -179,15 +173,6 @@ void grid_blit_to_window(struct VirtualGrid *g, WINDOW *win, int ox, int oy) {
 			if (!cell->occupied) continue;
 			int wx = (g->anchor_x + gx) + ox;
 			if (wx < 0 || wx >= ww) continue;
-			if (debugLog && (wy == 0 && wx <= 3)) {
-				fprintf(debugLog, "[BLIT] writing '%s' at win(%d,%d) from grid(%d,%d) anchor=(%d,%d) off=(%d,%d) cpair=%d\n",
-					cell->ch, wy, wx, g->anchor_x + gx, g->anchor_y + gy, g->anchor_x, g->anchor_y, ox, oy, cell->color_pair);
-			}
-			int slen = (int)strlen(cell->ch);
-			if (debugLog && slen > 1 && wx + slen > ww) {
-				fprintf(debugLog, "[BLIT OVERFLOW] '%s' (len=%d) at win(%d,%d) would overflow ww=%d\n",
-					cell->ch, slen, wy, wx, ww);
-			}
 			wattron(win, cell->attrs | COLOR_PAIR(cell->color_pair));
 			mvwprintw(win, wy, wx, "%s", cell->ch);
 			wattroff(win, cell->attrs | COLOR_PAIR(cell->color_pair));
@@ -222,7 +207,6 @@ void delObjects(struct ncursesObjects *objects) {
 }
 
 void quit(struct config *conf, struct ncursesObjects *objects, int returnCode) {
-	if (debugLog) { fprintf(debugLog, "=== quit ===\n"); fclose(debugLog); debugLog = NULL; }
 	delObjects(objects);
 	free(conf->saveFile);
 	free(conf->loadFile);
@@ -237,7 +221,7 @@ int saveToFile(char* fname, int seed, unsigned long long globalTime, time_t crea
 		return 1;
 	}
 
-	fprintf(fp, "%d %llu %ld %.6f", seed, globalTime, creationTime, secondsPerTick);
+	fprintf(fp, "v%d %d %llu %ld %.6f", 1, seed, globalTime, creationTime, secondsPerTick);
 	fclose(fp);
 
 	return 0;
@@ -257,10 +241,28 @@ int loadFromFile(struct config *conf) {
 	time_t creationTime;
 	double secondsPerTick;
 
-	if (fscanf(fp, "%i %llu %ld %lf", &seed, &globalTime, &creationTime, &secondsPerTick) != 4) {
+	char first[16] = {0};
+	if (fscanf(fp, "%15s", first) != 1) {
 		printf("error: save file could not be read\n");
 		fclose(fp);
 		return 1;
+	}
+
+	if (first[0] == 'v') {
+		conf->version = atoi(first + 1);
+		if (fscanf(fp, "%i %llu %ld %lf", &seed, &globalTime, &creationTime, &secondsPerTick) != 4) {
+			printf("error: save file could not be read\n");
+			fclose(fp);
+			return 1;
+		}
+	} else {
+		conf->version = 1;
+		seed = atoi(first);
+		if (fscanf(fp, "%llu %ld %lf", &globalTime, &creationTime, &secondsPerTick) != 3) {
+			printf("error: save file could not be read\n");
+			fclose(fp);
+			return 1;
+		}
 	}
 
 	conf->seed = seed;
@@ -633,6 +635,17 @@ void freeBranchList(struct BranchList* list) {
 	list->capacity = 0;
 }
 
+typedef void (*updateBranchFn)(struct config *conf, struct VirtualGrid *skeleton,
+	struct counters *myCounters, int branchIdx, struct BranchList *list);
+
+typedef void (*generateLeavesFn)(struct config *conf, struct VirtualGrid *grid,
+	enum branchType type, int x, int y, int life, unsigned int leaf_seed);
+
+struct TreeEngine {
+	updateBranchFn updateBranch;
+	generateLeavesFn generateLeaves;
+};
+
 static inline void update_position_history(struct Branch* branch) {
 	// Add new position to history
 	branch->x_history[branch->history_index] = branch->x;
@@ -647,10 +660,7 @@ static inline void update_position_history(struct Branch* branch) {
 
 static inline void get_average_position(struct Branch* branch, int* avg_x, int* avg_y) {
 	if (branch->history_count == 0) {
-		if (debugLog) fprintf(debugLog, "[get_average_position] history_count==0! branch pos=(%d,%d) type=%d life=%d age=%d totalLife=%d x_history={%d,%d,%d} y_history={%d,%d,%d}\n",
-			branch->x, branch->y, branch->type, branch->life, branch->age, branch->totalLife,
-			branch->x_history[0], branch->x_history[1], branch->x_history[2],
-			branch->y_history[0], branch->y_history[1], branch->y_history[2]);
+
 		*avg_x = branch->x;
 		*avg_y = branch->y;
 		return;
@@ -859,7 +869,7 @@ static inline int getBranchRollThreshold(int age, int totalLife, int multiplier)
 	return dice;
 }
 
-void updateBranch(struct config *conf, struct VirtualGrid *skeleton,
+void updateBranch_v1(struct config *conf, struct VirtualGrid *skeleton,
 				struct counters *myCounters, int branchIdx,
 				struct BranchList* list) {
 
@@ -1092,11 +1102,6 @@ void updateBranch(struct config *conf, struct VirtualGrid *skeleton,
 	int w = wcwidth(wc);
 	if (w <= 0) w = 1;
 	if(branch->x % w == 0) {
-		if (debugLog && branch->x == 0 && branch->y == 0) {
-			fprintf(debugLog, "[updateBranch AT (0,0)] type=%d life=%d age=%d displayType=%d str='%s' cpair=%d\n",
-				branch->type, branch->life, branch->age, displayType, branchStr, cr.color_pair);
-			fflush(debugLog);
-		}
 		grid_put(skeleton, branch->x, branch->y, branchStr, cr.attrs, cr.color_pair);
 	}
 
@@ -1388,7 +1393,7 @@ void init(struct config *conf, struct ncursesObjects *objects) {
 	drawMessage(conf, objects, conf->message);
 }
 
-void generateLeaves(struct config *conf, struct VirtualGrid *grid, enum branchType type, int x, int y, int life, unsigned int leaf_seed) {
+void generateLeaves_v1(struct config *conf, struct VirtualGrid *grid, enum branchType type, int x, int y, int life, unsigned int leaf_seed) {
 	while (life > 0) {
 		if (life <= 0) return;
 		life--;
@@ -1431,7 +1436,7 @@ void generateLeaves(struct config *conf, struct VirtualGrid *grid, enum branchTy
 			break;
 		}
 
-		generateLeaves(conf, grid, type, x, y, life, rand_r(&leaf_seed));
+		generateLeaves_v1(conf, grid, type, x, y, life, rand_r(&leaf_seed));
 
 		x += dx;
 		y += dy;
@@ -1458,6 +1463,18 @@ void generateLeaves(struct config *conf, struct VirtualGrid *grid, enum branchTy
 
 		grid_put(grid, x, y, conf->leaves[rand_r(&leaf_seed) % conf->leavesSize], la, lc);
 	}
+}
+
+struct TreeEngine get_engine(int version) {
+	struct TreeEngine engine;
+	switch (version) {
+	case 1:
+	default:
+		engine.updateBranch = updateBranch_v1;
+		engine.generateLeaves = generateLeaves_v1;
+		break;
+	}
+	return engine;
 }
 
 void recalculate_offsets(int trunk_x, int trunk_y, int baseHeight, WINDOW *win, int *ox, int *oy) {
@@ -1488,21 +1505,13 @@ void blitTree(struct VirtualGrid *skeleton, struct BranchList *branchList,
 		if (branchList->branches[i].leafGrid)
 			grid_blit_to_window(branchList->branches[i].leafGrid, objects->treeWin, off_x, off_y);
 	}
-	if (debugLog) {
-		chtype at00 = mvwinch(objects->treeWin, 0, 0);
-		char c00 = at00 & A_CHARTEXT;
-		int pair00 = PAIR_NUMBER(at00);
-		if (c00 != ' ' && c00 != 0) {
-			fprintf(debugLog, "[AFTER BLIT] char at (0,0): '%c' (0x%02x) pair=%d attrs=0x%lx\n",
-				(c00 >= 32 && c00 < 127) ? c00 : '?', (unsigned char)c00, pair00, (unsigned long)(at00 & A_ATTRIBUTES));
-			fflush(debugLog);
-		}
-	}
 }
 
 void growTree(struct config *conf, struct ncursesObjects *objects, struct counters *myCounters) {
 	int maxY, maxX;
 	getmaxyx(objects->treeWin, maxY, maxX);
+
+	struct TreeEngine engine = get_engine(conf->version);
 
 	int baseHeight = getBaseHeight(conf->baseType);
 	struct VirtualGrid *skeleton = grid_create(maxX, maxY + baseHeight, 0, 0);
@@ -1558,10 +1567,7 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 				int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
 				enum branchType newType = (b->type == trunk) ? dead : dying;
 
-				if (debugLog) fprintf(debugLog, "[growTree DEATH] branch type=%d life=%d age=%d totalLife=%d history_count=%d pos=(%d,%d) -> avg=(%d,%d) leafLife=%d\n",
-					b->type, b->life, b->age, b->totalLife, b->history_count, b->x, b->y, avg_x, avg_y, leafLife);
-
-				generateLeaves(conf, skeleton, newType, avg_x, avg_y, leafLife, leaf_seed);
+				engine.generateLeaves(conf, skeleton, newType, avg_x, avg_y, leafLife, leaf_seed);
 			}
 
 			grid_destroy(b->leafGrid);
@@ -1574,7 +1580,7 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 			continue;
 		}
 
-		updateBranch(conf, skeleton, myCounters, turn, &branchList);
+		engine.updateBranch(conf, skeleton, myCounters, turn, &branchList);
 
 		if (conf->live && conf->proceduralMode) {
 			for (int i = 0; i < branchList.count; i++) {
@@ -1607,10 +1613,7 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 
 					enum branchType newType = (b->type == trunk) ? dead : dying;
 
-					if (debugLog && b->history_count == 0) fprintf(debugLog, "[growTree LIVE] zero-history branch type=%d life=%d age=%d pos=(%d,%d) -> avg=(%d,%d) leafLife=%d\n",
-						b->type, b->life, b->age, b->x, b->y, avg_x, avg_y, targetLeafLife);
-
-					generateLeaves(conf, b->leafGrid, newType, avg_x, avg_y, targetLeafLife, b->leaf_seed);
+					engine.generateLeaves(conf, b->leafGrid, newType, avg_x, avg_y, targetLeafLife, b->leaf_seed);
 
 					b->leaf_steps_drawn = targetLeafLife;
 					b->leaf_cur_x = avg_x;
@@ -1768,9 +1771,6 @@ char* createDefaultCachePath(void) {
 int main(int argc, char* argv[]) {
 	setlocale(LC_ALL, "");
 
-	debugLog = fopen("/tmp/cbonsai_debug.log", "w");
-	if (debugLog) fprintf(debugLog, "=== cbonsai debug log ===\n");
-
 	struct config conf = {	// defaults
 		.live = 0,
 		.infinite = 0,
@@ -1782,6 +1782,7 @@ int main(int argc, char* argv[]) {
 		.baseType = 1,
 		.seed = 0,
 		.leavesSize = 0,
+		.version = 1,
 		.save = 0,
 		.load = 0,
 		.targetGlobalTime = 0,
