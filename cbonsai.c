@@ -14,6 +14,8 @@
 #include <unistd.h>
 #include <errno.h>
 
+FILE *debugLog = NULL;
+
 #define BRANCH_HISTORY 3 // moving average for proceedural leaves
 
 enum branchType {trunk, shootLeft, shootRight, dying, dead};
@@ -52,16 +54,146 @@ struct config {
 };
 
 struct ncursesObjects {
-	WINDOW* baseWin;
 	WINDOW* treeWin;
 	WINDOW* messageBorderWin;
 	WINDOW* messageWin;
 
-	PANEL* basePanel;
 	PANEL* treePanel;
 	PANEL* messageBorderPanel;
 	PANEL* messagePanel;
 };
+
+struct GridCell {
+	char ch[8];
+	attr_t attrs;
+	short color_pair;
+	int occupied;
+};
+
+struct VirtualGrid {
+	struct GridCell *cells;
+	int width, height;
+	int anchor_x, anchor_y;
+};
+
+struct ColorResult {
+	attr_t attrs;
+	short color_pair;
+};
+
+struct VirtualGrid* grid_create(int w, int h, int ax, int ay) {
+	struct VirtualGrid *g = malloc(sizeof(struct VirtualGrid));
+	g->width = w;
+	g->height = h;
+	g->anchor_x = ax;
+	g->anchor_y = ay;
+	g->cells = calloc(w * h, sizeof(struct GridCell));
+	return g;
+}
+
+void grid_destroy(struct VirtualGrid *g) {
+	if (!g) return;
+	free(g->cells);
+	free(g);
+}
+
+void grid_clear(struct VirtualGrid *g) {
+	memset(g->cells, 0, sizeof(struct GridCell) * g->width * g->height);
+}
+
+void grid_grow(struct VirtualGrid *g, int lx, int ly) {
+	int new_w = g->width;
+	int new_h = g->height;
+	int sx = 0, sy = 0;
+
+	if (lx < 0) {
+		int need = -lx;
+		int grow = (int)(g->width * 0.5);
+		if (grow < need) grow = need;
+		new_w += grow;
+		sx = grow;
+	} else if (lx >= g->width) {
+		int need = lx - g->width + 1;
+		int grow = (int)(g->width * 0.5);
+		if (grow < need) grow = need;
+		new_w += grow;
+	}
+
+	if (ly < 0) {
+		int need = -ly;
+		int grow = (int)(g->height * 0.5);
+		if (grow < need) grow = need;
+		new_h += grow;
+		sy = grow;
+	} else if (ly >= g->height) {
+		int need = ly - g->height + 1;
+		int grow = (int)(g->height * 0.5);
+		if (grow < need) grow = need;
+		new_h += grow;
+	}
+
+	struct GridCell *nc = calloc(new_w * new_h, sizeof(struct GridCell));
+	for (int y = 0; y < g->height; y++) {
+		memcpy(&nc[(y + sy) * new_w + sx],
+			   &g->cells[y * g->width],
+			   g->width * sizeof(struct GridCell));
+	}
+
+	free(g->cells);
+	g->cells = nc;
+	g->anchor_x -= sx;
+	g->anchor_y -= sy;
+	g->width = new_w;
+	g->height = new_h;
+}
+
+void grid_put(struct VirtualGrid *g, int tx, int ty, const char *str, attr_t attrs, short cpair) {
+	int lx = tx - g->anchor_x;
+	int ly = ty - g->anchor_y;
+	if (lx < 0 || lx >= g->width || ly < 0 || ly >= g->height) {
+		grid_grow(g, lx, ly);
+		lx = tx - g->anchor_x;
+		ly = ty - g->anchor_y;
+	}
+	if (debugLog && tx == 0 && ty == 0) {
+		fprintf(debugLog, "[GRID_PUT (0,0)] str='%s' cpair=%d lx=%d ly=%d anchor=(%d,%d)\n",
+			str, cpair, lx, ly, g->anchor_x, g->anchor_y);
+		fflush(debugLog);
+	}
+	struct GridCell *cell = &g->cells[ly * g->width + lx];
+	strncpy(cell->ch, str, sizeof(cell->ch) - 1);
+	cell->ch[sizeof(cell->ch) - 1] = '\0';
+	cell->attrs = attrs;
+	cell->color_pair = cpair;
+	cell->occupied = 1;
+}
+
+void grid_blit_to_window(struct VirtualGrid *g, WINDOW *win, int ox, int oy) {
+	int wh, ww;
+	getmaxyx(win, wh, ww);
+	for (int gy = 0; gy < g->height; gy++) {
+		int wy = (g->anchor_y + gy) + oy;
+		if (wy < 0 || wy >= wh) continue;
+		for (int gx = 0; gx < g->width; gx++) {
+			struct GridCell *cell = &g->cells[gy * g->width + gx];
+			if (!cell->occupied) continue;
+			int wx = (g->anchor_x + gx) + ox;
+			if (wx < 0 || wx >= ww) continue;
+			if (debugLog && (wy == 0 && wx <= 3)) {
+				fprintf(debugLog, "[BLIT] writing '%s' at win(%d,%d) from grid(%d,%d) anchor=(%d,%d) off=(%d,%d) cpair=%d\n",
+					cell->ch, wy, wx, g->anchor_x + gx, g->anchor_y + gy, g->anchor_x, g->anchor_y, ox, oy, cell->color_pair);
+			}
+			int slen = (int)strlen(cell->ch);
+			if (debugLog && slen > 1 && wx + slen > ww) {
+				fprintf(debugLog, "[BLIT OVERFLOW] '%s' (len=%d) at win(%d,%d) would overflow ww=%d\n",
+					cell->ch, slen, wy, wx, ww);
+			}
+			wattron(win, cell->attrs | COLOR_PAIR(cell->color_pair));
+			mvwprintw(win, wy, wx, "%s", cell->ch);
+			wattroff(win, cell->attrs | COLOR_PAIR(cell->color_pair));
+		}
+	}
+}
 
 struct counters {
 	int trunks;
@@ -73,26 +205,24 @@ struct counters {
 };
 
 void delObjects(struct ncursesObjects *objects) {
-	// delete panels
-	del_panel(objects->basePanel);
-	del_panel(objects->treePanel);
-	del_panel(objects->messageBorderPanel);
-	del_panel(objects->messagePanel);
+	if (objects->treePanel) del_panel(objects->treePanel);
+	if (objects->messageBorderPanel) del_panel(objects->messageBorderPanel);
+	if (objects->messagePanel) del_panel(objects->messagePanel);
 
-	// delete windows
-	delwin(objects->baseWin);
-	delwin(objects->treeWin);
-	delwin(objects->messageBorderWin);
-	delwin(objects->messageWin);
+	if (objects->treeWin) delwin(objects->treeWin);
+	if (objects->messageBorderWin) delwin(objects->messageBorderWin);
+	if (objects->messageWin) delwin(objects->messageWin);
+
+	objects->treePanel = NULL;
+	objects->messageBorderPanel = NULL;
+	objects->messagePanel = NULL;
+	objects->treeWin = NULL;
+	objects->messageBorderWin = NULL;
+	objects->messageWin = NULL;
 }
 
 void quit(struct config *conf, struct ncursesObjects *objects, int returnCode) {
-	if (conf->proceduralMode) {
-		// Restore original tree panel if we're in procedural mode (prevent error)
-		if (!objects->treePanel) {
-			objects->treePanel = new_panel(objects->treeWin);
-		}
-	}
+	if (debugLog) { fprintf(debugLog, "=== quit ===\n"); fclose(debugLog); debugLog = NULL; }
 	delObjects(objects);
 	free(conf->saveFile);
 	free(conf->loadFile);
@@ -129,6 +259,7 @@ int loadFromFile(struct config *conf) {
 
 	if (fscanf(fp, "%i %llu %ld %lf", &seed, &globalTime, &creationTime, &secondsPerTick) != 4) {
 		printf("error: save file could not be read\n");
+		fclose(fp);
 		return 1;
 	}
 
@@ -175,113 +306,126 @@ void printHelp(void) {
 			"  -l, --live             live mode: show each step of growth\n"
 			"  -t, --time=TIME        in live mode, wait TIME secs between\n"
 			"                           steps of growth (must be larger than 0) [default: 0.03]\n"
-			"  -P, --procedural       enable procedural leaf generation mode\n"
+			"  -P, --procedural       enable procedural leaf generation mode;\n"
+			"                           leaves grow incrementally using branch\n"
+			"                           position history for realistic placement\n"
 			"  -i, --infinite         infinite mode: keep growing trees\n"
 			"  -w, --wait=TIME        in infinite mode, wait TIME between each tree\n"
 			"                           generation [default: 4.00]\n"
-			"  -S, --screensaver      screensaver mode; equivalent to -li and\n"
-			"                           quit on any keypress\n"
+			"  -S, --screensaver      screensaver mode; equivalent to -li,\n"
+			"                           quits on any keypress, and handles\n"
+			"                           terminal resizing gracefully\n"
 			"  -m, --message=STR      attach message next to the tree\n"
 			"  -T, --msgtime=SECS     clear message after SECS seconds\n"
-			"  -b, --base=INT         ascii-art plant base to use, 0 is none\n"
-			"  -c, --leaf=LIST        list of comma-delimited strings randomly chosen\n"
-			"                           for leaves\n"
+			"                           [default: no timeout, message stays]\n"
+			"  -b, --base=INT         ascii-art plant base to use:\n"
+			"                           0 = none, 1 = large pot, 2 = small pot\n"
+			"                           [default: 1]\n"
+			"  -c, --leaf=LIST        list of comma-delimited strings randomly\n"
+			"                           chosen for leaves [default: "
+#ifdef _WIN32
+			"#,#,*,.,\n"
+#else
+			"█,█,█,▒,▒]\n"
+#endif
 			"  -M, --multiplier=INT   branch multiplier; higher -> more\n"
 			"                           branching (0-20) [default: 8]\n"
-			"  -N, --name=TIME        create a named tree that grows over real time,\n"
-			"                           where TIME is life of tree in seconds.\n"
-			"                           MUST be used with -C to specify a save file.\n"
-			"                           (automatically enables -l and -P)\n"
+			"  -N, --name=TIME        create a named tree that grows over real\n"
+			"                           time, where TIME is the full lifespan\n"
+			"                           of the tree in seconds. MUST be used\n"
+			"                           with -W to specify a save file.\n"
+			"                           Automatically enables -l and -P.\n"
+			"                           Use -C to load and continue growing\n"
+			"                           a previously saved named tree.\n"
 			"  -L, --life=INT         life; higher -> more growth (0-200) [default: 120]\n"
 			"  -p, --print            print tree to terminal when finished\n"
 			"  -s, --seed=INT         seed random number generator\n"
-			"  -W, --save=FILE        save progress to file [default: $XDG_CACHE_HOME/cbonsai or $HOME/.cache/cbonsai]\n"
-			"  -C, --load=FILE        load progress from file [default: $XDG_CACHE_HOME/cbonsai]\n"
+			"  -W, --save=FILE        save progress to file\n"
+			"                           [default: $XDG_CACHE_HOME/cbonsai\n"
+			"                            or $HOME/.cache/cbonsai]\n"
+			"  -C, --load=FILE        load progress from file\n"
+			"                           [default: $XDG_CACHE_HOME/cbonsai\n"
+			"                            or $HOME/.cache/cbonsai]\n"
 			"  -v, --verbose          increase output verbosity\n"
 			"  -h, --help             show help\n"
 	);
 }
 
-void drawBase(WINDOW* baseWin, int baseType) {
-	// draw base art
-	switch(baseType) {
-	case 1:
-		wattron(baseWin, A_BOLD | COLOR_PAIR(8));
-		wprintw(baseWin, "%s", ":");
-		wattron(baseWin, COLOR_PAIR(23));
-		wprintw(baseWin, "%s", "__________");
-		wattron(baseWin, COLOR_PAIR(20));
-		wprintw(baseWin, "%s", "./~~~~\\.");
-		wattron(baseWin, COLOR_PAIR(23));
-		wprintw(baseWin, "%s", "___________");
-		wattron(baseWin, COLOR_PAIR(8));
-		wprintw(baseWin, "%s", ":");
-
-		mvwprintw(baseWin, 1, 0, "%s", " \\                           / ");
-		mvwprintw(baseWin, 2, 0, "%s", "  \\_________________________/ ");
-		mvwprintw(baseWin, 3, 0, "%s", "  (_)                     (_)");
-
-		wattroff(baseWin, A_BOLD);
-		break;
-	case 2:
-		wattron(baseWin, COLOR_PAIR(8));
-		wprintw(baseWin, "%s", "(");
-		wattron(baseWin, COLOR_PAIR(2));
-		wprintw(baseWin, "%s", "---");
-		wattron(baseWin, COLOR_PAIR(11));
-		wprintw(baseWin, "%s", "./~~~~\\.");
-		wattron(baseWin, COLOR_PAIR(2));
-		wprintw(baseWin, "%s", "--");
-		wattron(baseWin, COLOR_PAIR(8));
-		wprintw(baseWin, "%s", ")");
-
-		mvwprintw(baseWin, 1, 0, "%s", " (           ) ");
-		mvwprintw(baseWin, 2, 0, "%s", "  (_________)  ");
-		break;
+static void grid_put_str(struct VirtualGrid *g, int tx, int ty, const char *str, attr_t attrs, short cpair) {
+	for (int i = 0; str[i]; i++) {
+		char ch[2] = { str[i], '\0' };
+		grid_put(g, tx + i, ty, ch, attrs, cpair);
 	}
 }
 
-void drawWins(int baseType, struct ncursesObjects *objects) {
-	int baseWidth = 0;
-	int baseHeight = 0;
-	int rows, cols;
-
+int getBaseHeight(int baseType) {
 	switch(baseType) {
-	case 1:
-		baseWidth = 31;
-		baseHeight = 4;
-		break;
-	case 2:
-		baseWidth = 15;
-		baseHeight = 3;
-		break;
+	case 1: return 4;
+	case 2: return 3;
+	default: return 0;
+	}
+}
+
+void drawBaseToGrid(struct VirtualGrid *grid, int baseType, int trunk_x, int trunk_y) {
+	if (baseType <= 0) return;
+
+	int baseWidth, baseHeight;
+	switch(baseType) {
+	case 1: baseWidth = 31; baseHeight = 4; break;
+	case 2: baseWidth = 15; baseHeight = 3; break;
+	default: return;
 	}
 
-	// calculate where base should go
-	getmaxyx(stdscr, rows, cols);
-	int baseOriginY = (rows - baseHeight);
-	int baseOriginX = (cols / 2) - (baseWidth / 2);
+	int bx = trunk_x - baseWidth / 2;
+	int by = trunk_y + 1;
 
-	// clean up old objects
+	switch(baseType) {
+	case 1: {
+		int x = bx;
+		grid_put(grid, x++, by, ":", A_BOLD, 8);
+		grid_put_str(grid, x, by, "__________", A_BOLD, 23); x += 10;
+		grid_put_str(grid, x, by, "./~~~~\\.", A_BOLD, 20); x += 8;
+		grid_put_str(grid, x, by, "___________", A_BOLD, 23); x += 11;
+		grid_put(grid, x, by, ":", A_BOLD, 8);
+
+		grid_put_str(grid, bx, by + 1, " \\                           / ", A_BOLD, 8);
+		grid_put_str(grid, bx, by + 2, "  \\_________________________/ ", A_BOLD, 8);
+		grid_put_str(grid, bx, by + 3, "  (_)                     (_)", A_BOLD, 8);
+		break;
+	}
+	case 2: {
+		int x = bx;
+		grid_put(grid, x++, by, "(", 0, 8);
+		grid_put_str(grid, x, by, "---", 0, 2); x += 3;
+		grid_put_str(grid, x, by, "./~~~~\\.", 0, 11); x += 8;
+		grid_put_str(grid, x, by, "--", 0, 2); x += 2;
+		grid_put(grid, x, by, ")", 0, 8);
+
+		grid_put_str(grid, bx, by + 1, " (           ) ", 0, 8);
+		grid_put_str(grid, bx, by + 2, "  (_________)  ", 0, 8);
+		break;
+	}
+	}
+	(void)baseHeight;
+}
+
+void drawWins(struct ncursesObjects *objects) {
+	int rows, cols;
+	getmaxyx(stdscr, rows, cols);
+
 	delObjects(objects);
 
-	// create windows
-	objects->baseWin = newwin(baseHeight, baseWidth, baseOriginY, baseOriginX);
-	objects->treeWin = newwin(rows - baseHeight, cols, 0, 0);
-
-	// create tree and base panels
-	objects->basePanel = new_panel(objects->baseWin);
+	objects->treeWin = newwin(rows, cols, 0, 0);
 	objects->treePanel = new_panel(objects->treeWin);
-
-	drawBase(objects->baseWin, baseType);
 }
 
 // roll (randomize) a given die
 static inline void roll(int *dice, int mod) { *dice = rand() % mod; }
 
-// check for key press
+// check for key press: 0=nothing, 1=quit, 2=resize
 int checkKeyPress(const struct config *conf, struct counters *myCounters) {
 	int ch = wgetch(stdscr);
+	if (ch == KEY_RESIZE) return 2;
 	if ((conf->screensaver && ch != ERR) || ch == 'q') {
 		finish(conf, myCounters);
 		return 1;
@@ -388,39 +532,40 @@ enum Season get_current_season_with_blend(float *blend_ratio) {
     return current_season;
 }
 
-// based on type of tree, determine what color a branch should be
-void chooseColor(enum branchType type, WINDOW* treeWin) {
+struct ColorResult chooseColorResult(enum branchType type) {
+	struct ColorResult cr = {0, 0};
 	int r;
 	switch(type) {
 	case trunk:
-		r = rand() % 4;  // Get a number 0-3	
-		if (r < 2) wattron(treeWin, A_BOLD | COLOR_PAIR(20));      // 0,1 (50% chance)
-		else if (r == 2) wattron(treeWin, COLOR_PAIR(20));         // 2 (25% chance)
-		else wattron(treeWin, COLOR_PAIR(21));                     // 3 (25% chance)
-		break; 
+		r = rand() % 4;
+		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 20; }
+		else if (r == 2) { cr.color_pair = 20; }
+		else { cr.color_pair = 21; }
+		break;
 
 	case shootLeft:
 	case shootRight:
-		r = rand() % 10;  // Get a number 0-9
-		if (r < 2) wattron(treeWin, A_BOLD | COLOR_PAIR(20));
-		else if (r < 6) wattron(treeWin, A_BOLD | COLOR_PAIR(21));
-		else wattron(treeWin, COLOR_PAIR(21));
+		r = rand() % 10;
+		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 20; }
+		else if (r < 6) { cr.attrs = A_BOLD; cr.color_pair = 21; }
+		else { cr.color_pair = 21; }
 		break;
 
 	case dying:
-		r = rand() % 6;  // Get a number 0-5
-		if (r < 3) wattron(treeWin, COLOR_PAIR(22));
-		else if (r < 5) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
-		else wattron(treeWin, COLOR_PAIR(23));
+		r = rand() % 6;
+		if (r < 3) { cr.color_pair = 22; }
+		else if (r < 5) { cr.attrs = A_BOLD; cr.color_pair = 22; }
+		else { cr.color_pair = 23; }
 		break;
 
 	case dead:
-		r = rand() % 18;  // Get a number 0-17
-		if (r < 2) wattron(treeWin, A_BOLD | COLOR_PAIR(23));
-		else if (r < 8) wattron(treeWin, A_BOLD | COLOR_PAIR(22));
-		else wattron(treeWin, COLOR_PAIR(22));
+		r = rand() % 18;
+		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 23; }
+		else if (r < 8) { cr.attrs = A_BOLD; cr.color_pair = 22; }
+		else { cr.color_pair = 22; }
 		break;
 	}
+	return cr;
 }
 
 // New structures to add
@@ -439,6 +584,10 @@ struct Branch {
 	int y_history[BRANCH_HISTORY];          // Circular buffer for last BRANCH_HISTORY y positions
 	int history_count;         // How many positions we've stored (max BRANCH_HISTORY)
 	int history_index;         // Current index in circular buffer
+
+	struct VirtualGrid *leafGrid;
+	int leaf_steps_drawn;
+	int leaf_cur_x, leaf_cur_y;
 };
 
 struct BranchList {
@@ -457,7 +606,12 @@ void addBranch(struct BranchList* list, struct Branch branch, struct counters *m
 	myCounters->branches++;
 	if (list->count >= list->capacity) {
 		list->capacity *= 2;
-		list->branches = realloc(list->branches, sizeof(struct Branch) * list->capacity);
+		struct Branch *tmp = realloc(list->branches, sizeof(struct Branch) * list->capacity);
+		if (!tmp) {
+			list->capacity /= 2;
+			return;
+		}
+		list->branches = tmp;
 	}
 	list->branches[list->count++] = branch;
 }
@@ -470,6 +624,9 @@ void removeBranch(struct BranchList* list, int index) {
 }
 
 void freeBranchList(struct BranchList* list) {
+	for (int i = 0; i < list->count; i++) {
+		grid_destroy(list->branches[i].leafGrid);
+	}
 	free(list->branches);
 	list->branches = NULL;
 	list->count = 0;
@@ -489,17 +646,22 @@ static inline void update_position_history(struct Branch* branch) {
 }
 
 static inline void get_average_position(struct Branch* branch, int* avg_x, int* avg_y) {
+	if (branch->history_count == 0) {
+		if (debugLog) fprintf(debugLog, "[get_average_position] history_count==0! branch pos=(%d,%d) type=%d life=%d age=%d totalLife=%d x_history={%d,%d,%d} y_history={%d,%d,%d}\n",
+			branch->x, branch->y, branch->type, branch->life, branch->age, branch->totalLife,
+			branch->x_history[0], branch->x_history[1], branch->x_history[2],
+			branch->y_history[0], branch->y_history[1], branch->y_history[2]);
+		*avg_x = branch->x;
+		*avg_y = branch->y;
+		return;
+	}
 	int sum_x = 0, sum_y = 0;
-	
-	// Use all available history points
 	for (int i = 0; i < branch->history_count; i++) {
 		sum_x += branch->x_history[i];
 		sum_y += branch->y_history[i];
 	}
-	
-	// Calculate averages
-	*avg_x = sum_x / (branch->history_count > 0 ? branch->history_count : 1);
-	*avg_y = sum_y / (branch->history_count > 0 ? branch->history_count : 1);
+	*avg_x = sum_x / branch->history_count;
+	*avg_y = sum_y / branch->history_count;
 }
 
 // Check if we're in the early trunk phase (first 30% of life)
@@ -697,14 +859,11 @@ static inline int getBranchRollThreshold(int age, int totalLife, int multiplier)
 	return dice;
 }
 
-void updateBranch(struct config *conf, struct ncursesObjects *objects, 
-				struct counters *myCounters, struct Branch* branch, 
+void updateBranch(struct config *conf, struct VirtualGrid *skeleton,
+				struct counters *myCounters, int branchIdx,
 				struct BranchList* list) {
 
-	// Simulate one step of branch growth
-	if (checkKeyPress(conf, myCounters) == 1)
-		quit(conf, objects, 0);
-
+	struct Branch *branch = &list->branches[branchIdx];
 	branch->life--;     // decrement remaining life counter
 
 	// Random die-off check - more likely on shoots
@@ -720,11 +879,11 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 
 	branch->age++;
 
-	setDeltas(branch->type, branch->life, branch->totalLife, 
+	setDeltas(branch->type, branch->life, branch->totalLife,
 			  branch->age, branch->multiplier, &branch->dx, &branch->dy);
 
-	int maxY = getmaxy(objects->treeWin);
-	if (branch->dy > 0 && branch->y > (maxY - 2)) 
+	int maxY = skeleton->anchor_y + skeleton->height;
+	if (branch->dy > 0 && branch->y > (maxY - 2))
 		branch->dy--; // reduce dy if too close to the ground
 
 	// near-dead branch should branch into a lot of leaves
@@ -746,6 +905,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 			.y_history[0] = branch->y
 		};
 		addBranch(list, newBranch, myCounters);
+		branch = &list->branches[branchIdx];
 	}
 	else if (branch->type == shootLeft || branch->type == shootRight) {
 		if (branch->life < 7 + (branch->multiplier /5)) {
@@ -766,6 +926,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 				.y_history[0] = branch->y
 			};
 			addBranch(list, newBranch, myCounters);
+			branch = &list->branches[branchIdx];
 		}
 		else if (branch->dripLeafCooldown <= 0 && (rand() % 3) == 0) {
 			struct Branch newBranch = {
@@ -785,6 +946,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 				.y_history[0] = branch->y
 			};
 			addBranch(list, newBranch, myCounters);
+			branch = &list->branches[branchIdx];
 			branch->dripLeafCooldown = 7+ (25 + branch->multiplier);
 		}
 	}
@@ -807,6 +969,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 			.y_history[0] = branch->y
 		};
 		addBranch(list, newBranch, myCounters);
+		branch = &list->branches[branchIdx];
 	}
 	// dying shoot should branch into a lot of leaves
 	else if ((branch->type == shootLeft || branch->type == shootRight) && 
@@ -828,6 +991,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 			.y_history[0] = branch->y
 		};
 		addBranch(list, newBranch, myCounters);
+		branch = &list->branches[branchIdx];
 	}
 	else if (branch->type == trunk) {
 		branch->life--;
@@ -866,6 +1030,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 					.y_history[0] = branch->y
 				};
 				addBranch(list, newBranch, myCounters);
+				branch = &list->branches[branchIdx];
 				branch->life -= rand() % 1+ (int)(5 * ((double)branch->totalLife - branch->age)/branch->totalLife); // cost of splitting
 			}
 		}
@@ -878,8 +1043,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 			
 			myCounters->shoots++;
 			myCounters->shootCounter++;
-			if (conf->verbosity)
-				mvwprintw(objects->treeWin, 4, 5, "shoots: %02d", myCounters->shoots);
+			(void)0; // verbose shoot count displayed during render
 			
 			struct Branch newBranch = {
 				.x = branch->x,
@@ -898,6 +1062,7 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 				.y_history[0] = branch->y
 			};
 			addBranch(list, newBranch, myCounters);
+			branch = &list->branches[branchIdx];
 
 			branch->life -= rand() % 3; // cost of sprouting
 		}
@@ -906,42 +1071,35 @@ void updateBranch(struct config *conf, struct ncursesObjects *objects,
 	branch->shootCooldown--;
 	branch->dripLeafCooldown--;
 
-	if (conf->verbosity > 0) {
-		mvwprintw(objects->treeWin, 5, 5, "dx: %02d", branch->dx);
-		mvwprintw(objects->treeWin, 6, 5, "dy: %02d", branch->dy);
-		mvwprintw(objects->treeWin, 7, 5, "type: %d", branch->type);
-		mvwprintw(objects->treeWin, 8, 5, "shootCooldown: % 3d", branch->shootCooldown);
-		mvwprintw(objects->treeWin, 9, 5, "globalTime: %llu", myCounters->globalTime);
-		mvwprintw(objects->treeWin, 10, 5, "seed: %u", conf->seed);
-		mvwprintw(objects->treeWin, 11, 5, "targetGlobalTime: %llu", conf->targetGlobalTime);
-		mvwprintw(objects->treeWin, 12, 5, "secondsPerTick: %.6f", conf->secondsPerTick);
-		mvwprintw(objects->treeWin, 13, 5, "timeStep: %.6f", conf->timeStep);
-		mvwprintw(objects->treeWin, 14, 5, "loadState: %d", conf->load ? 1 : 0);
-	}
-
 	// move in x and y directions
 	branch->x += branch->dx;
 	branch->y += branch->dy;
 	if(conf->proceduralMode && branch->type != dying && branch->type != dead)
 		update_position_history(branch);
 
-	chooseColor(branch->type, objects->treeWin);
+	enum branchType displayType = (branch->life < 4) ? dying : branch->type;
+	struct ColorResult cr = chooseColorResult(displayType);
 
 	// choose string to use for this branch
-	char *branchStr = chooseString(conf, branch->type, branch->life, branch->dx, branch->dy);
+	char *branchStr = chooseString(conf, displayType, branch->life, branch->dx, branch->dy);
 
 	// grab wide character from branchStr
 	wchar_t wc = 0;
-	mbstate_t *ps = 0;
-	mbrtowc(&wc, branchStr, 32, ps);
+	mbstate_t ps = {0};
+	mbrtowc(&wc, branchStr, 32, &ps);
 
-	// print, but ensure wide characters don't overlap
+	// write to grid, but ensure wide characters don't overlap
 	int w = wcwidth(wc);
-	if (w <= 0) w = 1;  // zero-width / non-printable / decode failure: treat as width 1
-	if(branch->x % w == 0)
-		mvwprintw(objects->treeWin, branch->y, branch->x, "%s", branchStr);
+	if (w <= 0) w = 1;
+	if(branch->x % w == 0) {
+		if (debugLog && branch->x == 0 && branch->y == 0) {
+			fprintf(debugLog, "[updateBranch AT (0,0)] type=%d life=%d age=%d displayType=%d str='%s' cpair=%d\n",
+				branch->type, branch->life, branch->age, displayType, branchStr, cr.color_pair);
+			fflush(debugLog);
+		}
+		grid_put(skeleton, branch->x, branch->y, branchStr, cr.attrs, cr.color_pair);
+	}
 
-	wattroff(objects->treeWin, A_BOLD);
 	free(branchStr);
 }
 
@@ -959,9 +1117,18 @@ void addSpaces(WINDOW* messageWin, int count, int *linePosition, int maxWidth) {
 }
 
 // create ncurses windows to contain message and message box
-void createMessageWindows(struct ncursesObjects *objects, char* message) {
+// returns 0 on success, 1 if terminal too small
+int createMessageWindows(struct ncursesObjects *objects, char* message) {
 	int maxY, maxX;
 	getmaxyx(stdscr, maxY, maxX);
+
+	if (maxX < 10 || maxY < 4) {
+		objects->messageBorderWin = NULL;
+		objects->messageWin = NULL;
+		objects->messageBorderPanel = NULL;
+		objects->messagePanel = NULL;
+		return 1;
+	}
 
 	int boxWidth = 0;
 	int boxHeight = 0;
@@ -971,27 +1138,48 @@ void createMessageWindows(struct ncursesObjects *objects, char* message) {
 		boxHeight = 1;
 	} else {
 		boxWidth = 0.25 * maxX;
+		if (boxWidth < 4) boxWidth = 4;
 		boxHeight = (strlen(message) / boxWidth) + (strlen(message) / boxWidth);
 	}
 
-	// create separate box for message border
-	objects->messageBorderWin = newwin(boxHeight + 2, boxWidth + 4, (maxY * 0.3) - 1, (maxX * 0.7) - 2);
-	objects->messageWin = newwin(boxHeight, boxWidth + 1, maxY * 0.3, maxX * 0.7);
+	int borderW = boxWidth + 4;
+	int borderH = boxHeight + 2;
+	int borderY = (int)(maxY * 0.3) - 1;
+	int borderX = (int)(maxX * 0.7) - 2;
 
-	// draw box
+	if (borderY < 0) borderY = 0;
+	if (borderX < 0) borderX = 0;
+	if (borderX + borderW > maxX) borderW = maxX - borderX;
+	if (borderY + borderH > maxY) borderH = maxY - borderY;
+	if (borderW < 3 || borderH < 3) {
+		objects->messageBorderWin = NULL;
+		objects->messageWin = NULL;
+		objects->messageBorderPanel = NULL;
+		objects->messagePanel = NULL;
+		return 1;
+	}
+
+	int msgW = borderW - 3;
+	int msgH = borderH - 2;
+	int msgY = borderY + 1;
+	int msgX = borderX + 2;
+
+	objects->messageBorderWin = newwin(borderH, borderW, borderY, borderX);
+	objects->messageWin = newwin(msgH, msgW, msgY, msgX);
+
 	wattron(objects->messageBorderWin, COLOR_PAIR(8) | A_BOLD);
 	wborder(objects->messageBorderWin, '|', '|', '-', '-', '+', '+', '+', '+');
 
-	// create message panels
 	objects->messageBorderPanel = new_panel(objects->messageBorderWin);
 	objects->messagePanel = new_panel(objects->messageWin);
+	return 0;
 }
 
 int drawMessage(struct config *conf, struct ncursesObjects *objects, char* message) {
 	if (!message) return 1;
 
-	conf->messageStartTime = time(NULL);  // Set start time when drawing message
-	createMessageWindows(objects, message);
+	conf->messageStartTime = time(NULL);
+	if (createMessageWindows(objects, message) != 0) return 1;
 
 	int maxWidth = getmaxx(objects->messageWin) - 2;
 
@@ -1196,30 +1384,11 @@ void init(struct config *conf, struct ncursesObjects *objects) {
 	// else: no color support at all — pairs remain at defaults, tree renders in terminal's default color
 
 	// define and draw windows, then create panels
-	drawWins(conf->baseType, objects);
+	drawWins(objects);
 	drawMessage(conf, objects, conf->message);
 }
 
-WINDOW* duplicateWindow(WINDOW* source) {
-	int height, width, startx, starty;
-	getbegyx(source, starty, startx);
-	getmaxyx(source, height, width);
-	
-	WINDOW* duplicate = newwin(height, width, starty, startx);
-	
-	// Copy content and attributes
-	for (int y = 0; y < height; y++) {
-		for (int x = 0; x < width; x++) {
-			chtype ch = mvwinch(source, y, x);
-			mvwaddch(duplicate, y, x, ch);
-		}
-	}
-	
-	return duplicate;
-}
-
-// Simple recursive function to generate leaves at a position
-void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int x, int y, int life, unsigned int leaf_seed) {
+void generateLeaves(struct config *conf, struct VirtualGrid *grid, enum branchType type, int x, int y, int life, unsigned int leaf_seed) {
 	while (life > 0) {
 		if (life <= 0) return;
 		life--;
@@ -1227,7 +1396,7 @@ void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int 
 		int dx = 0, dy = 0, dice;
 		switch (type)
 		{
-		case 3: // dying: discourage vertical growth(?); trend left/right (-3,3)
+		case 3:
 			dice = rand_r(&leaf_seed) % 10;
 			if (dice >= 0 && dice <=0) dy = -1;
 			else if (dice >= 1 && dice <=8) dy = 0;
@@ -1243,12 +1412,12 @@ void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int 
 			else if (dice >= 14 && dice <= 14) dx = 3;
 			break;
 
-		case 4: // dead: fill in surrounding area
+		case 4:
 			dice = rand_r(&leaf_seed) % 12;
 			if (dice >= 0 && dice <= 1) dy = -1;
 			else if (dice >= 2 && dice <= 8) dy = 0;
 			else if (dice >= 9 && dice <= 11) dy = 1;
-			
+
 			dice = rand_r(&leaf_seed) % 15;
 			if (dice >= 0 && dice <=1) dx = -3;
 			else if (dice >= 2 && dice <= 3) dx = -2;
@@ -1262,99 +1431,100 @@ void generateLeaves(struct config *conf, WINDOW* win, enum branchType type, int 
 			break;
 		}
 
-		int maxY, maxX;
-		getmaxyx(win, maxY, maxX);
-		if (dy > 0 && y > (maxY - 2)) dy--;
-
-		generateLeaves(conf, win, type, x, y, life, rand_r(&leaf_seed)); // more leaves
+		generateLeaves(conf, grid, type, x, y, life, rand_r(&leaf_seed));
 
 		x += dx;
 		y += dy;
 
-		if (x >= 0 && x < maxX && y >= 0 && y < maxY) {
-
-			switch(type) 
-			{
-			case trunk:
-			case shootLeft:
-			case shootRight:
-				break;
-			case dying:
-				if (rand_r(&leaf_seed) % 6 == 0) wattron(win, COLOR_PAIR(22));
-				else if (rand_r(&leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(23));
-				else wattron(win, COLOR_PAIR(23));
-				break;
-
-			case dead:
-				if (rand_r(&leaf_seed) % 7 == 0) wattron(win, A_BOLD | COLOR_PAIR(22));
-				else if (rand_r(&leaf_seed) % 2 == 0) wattron(win, A_BOLD | COLOR_PAIR(23));
-				else wattron(win, COLOR_PAIR(23));
-				break;
-			}
-
-			mvwprintw(win, y, x, "%s", conf->leaves[rand_r(&leaf_seed) % conf->leavesSize]);
+		attr_t la = 0;
+		short lc = 0;
+		switch(type)
+		{
+		case trunk:
+		case shootLeft:
+		case shootRight:
+			break;
+		case dying:
+			if (rand_r(&leaf_seed) % 6 == 0) { lc = 22; }
+			else if (rand_r(&leaf_seed) % 2 == 0) { la = A_BOLD; lc = 23; }
+			else { lc = 23; }
+			break;
+		case dead:
+			if (rand_r(&leaf_seed) % 7 == 0) { la = A_BOLD; lc = 22; }
+			else if (rand_r(&leaf_seed) % 2 == 0) { la = A_BOLD; lc = 23; }
+			else { lc = 23; }
+			break;
 		}
+
+		grid_put(grid, x, y, conf->leaves[rand_r(&leaf_seed) % conf->leavesSize], la, lc);
 	}
 }
 
-int delayWithKeyCheck(struct config *conf, struct counters *myCounters, struct ncursesObjects *objects, float waitTime) {
-	const float CHECK_INTERVAL = 0.2;  // Check every 0.2 seconds
-	float remainingTime = waitTime;
+void recalculate_offsets(int trunk_x, int trunk_y, int baseHeight, WINDOW *win, int *ox, int *oy) {
+	int h, w;
+	getmaxyx(win, h, w);
+	*ox = (w / 2) - trunk_x;
+	*oy = (h - 1 - baseHeight) - trunk_y;
+}
 
-	while (remainingTime > 0) {
-		float sleepTime = (remainingTime > CHECK_INTERVAL) ? CHECK_INTERVAL : remainingTime;
-
-		// Check if message should be cleared
-		if (conf->messageTimeout > 0 && conf->message != NULL && objects->messagePanel != NULL) {
-			time_t currentTime = time(NULL);
-			if (currentTime - conf->messageStartTime >= conf->messageTimeout) {
-				clearMessage(objects);
-				conf->message = NULL;  // Clear the message pointer
-			}
-		}
-
-		updateScreen(sleepTime);
-		
-		if (checkKeyPress(conf, myCounters) == 1) {
-			return 1;  // Signal that we should quit
-		}
-		
-		remainingTime -= sleepTime;
+void handleResize(struct config *conf, struct ncursesObjects *objects,
+				  int trunk_x, int trunk_y, int baseHeight, int *off_x, int *off_y) {
+	endwin();
+	refresh();
+	drawWins(objects);
+	if (conf->message) {
+		time_t saved = conf->messageStartTime;
+		drawMessage(conf, objects, conf->message);
+		conf->messageStartTime = saved;
 	}
-	return 0;
+	recalculate_offsets(trunk_x, trunk_y, baseHeight, objects->treeWin, off_x, off_y);
+}
+
+void blitTree(struct VirtualGrid *skeleton, struct BranchList *branchList,
+			  struct ncursesObjects *objects, int off_x, int off_y) {
+	werase(objects->treeWin);
+	grid_blit_to_window(skeleton, objects->treeWin, off_x, off_y);
+	for (int i = 0; i < branchList->count; i++) {
+		if (branchList->branches[i].leafGrid)
+			grid_blit_to_window(branchList->branches[i].leafGrid, objects->treeWin, off_x, off_y);
+	}
+	if (debugLog) {
+		chtype at00 = mvwinch(objects->treeWin, 0, 0);
+		char c00 = at00 & A_CHARTEXT;
+		int pair00 = PAIR_NUMBER(at00);
+		if (c00 != ' ' && c00 != 0) {
+			fprintf(debugLog, "[AFTER BLIT] char at (0,0): '%c' (0x%02x) pair=%d attrs=0x%lx\n",
+				(c00 >= 32 && c00 < 127) ? c00 : '?', (unsigned char)c00, pair00, (unsigned long)(at00 & A_ATTRIBUTES));
+			fflush(debugLog);
+		}
+	}
 }
 
 void growTree(struct config *conf, struct ncursesObjects *objects, struct counters *myCounters) {
 	int maxY, maxX;
 	getmaxyx(objects->treeWin, maxY, maxX);
-	WINDOW* tempState = NULL;
-	PANEL* tempPanel = NULL;
 
-	if (conf->proceduralMode && conf->live) {
-		del_panel(objects->treePanel);
-		objects->treePanel = NULL;
-	}
+	int baseHeight = getBaseHeight(conf->baseType);
+	struct VirtualGrid *skeleton = grid_create(maxX, maxY + baseHeight, 0, 0);
+	int trunk_x = maxX / 2;
+	int trunk_y = maxY - 1 - baseHeight;
+	int off_x = 0, off_y = 0;
 
-	if (conf->verbosity > 0) {
-		mvwprintw(objects->treeWin, 2, 5, "maxX: %03d, maxY: %03d", maxX, maxY);
-	}
+	drawBaseToGrid(skeleton, conf->baseType, trunk_x, trunk_y);
 
-	// Initialize branch list
 	struct BranchList branchList;
 	initBranchList(&branchList);
 
-	// reset counters
 	myCounters->trunks = 0;
 	myCounters->shoots = 0;
 	myCounters->branches = 0;
 	myCounters->shootCounter = 5;
 	myCounters->globalTime = 0;
 	myCounters->trunkSplitCooldown = 0;
-	
-	// Create initial trunk branch
+
 	struct Branch initialBranch = {
-		.x = maxX / 2,
-		.y = maxY - 1,
+		.x = trunk_x,
+		.y = trunk_y,
 		.life = conf->lifeStart,
 		.age = 0,
 		.type = trunk,
@@ -1365,33 +1535,6 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 	};
 	addBranch(&branchList, initialBranch, myCounters);
 
-	if (conf->live && conf->proceduralMode && tempState == NULL) {
-		tempState = duplicateWindow(objects->treeWin);
-		tempPanel = new_panel(tempState);
-
-		// If we have message windows, recreate them on top
-		if (objects->messageWin && objects->messageBorderWin) {
-			// Store current panels/windows
-			PANEL* oldMessagePanel = objects->messagePanel;
-			PANEL* oldBorderPanel = objects->messageBorderPanel;
-			WINDOW* messageWin = objects->messageWin;
-			WINDOW* borderWin = objects->messageBorderWin;
-			
-			// Create new panels for existing windows
-			objects->messagePanel = new_panel(messageWin);
-			objects->messageBorderPanel = new_panel(borderWin);
-			
-			// Delete old panels
-			del_panel(oldMessagePanel);
-			del_panel(oldBorderPanel);
-			
-			// Ensure message panels are on top
-			top_panel(objects->messageBorderPanel);
-			top_panel(objects->messagePanel);
-		}
-	}
-
-	// Main growth loop
 	int turn = 0;
 	while (branchList.count > 0) {
 		myCounters->globalTime++;
@@ -1415,8 +1558,15 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 				int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
 				enum branchType newType = (b->type == trunk) ? dead : dying;
 
-				generateLeaves(conf, objects->treeWin, newType, avg_x, avg_y, leafLife, leaf_seed);
+				if (debugLog) fprintf(debugLog, "[growTree DEATH] branch type=%d life=%d age=%d totalLife=%d history_count=%d pos=(%d,%d) -> avg=(%d,%d) leafLife=%d\n",
+					b->type, b->life, b->age, b->totalLife, b->history_count, b->x, b->y, avg_x, avg_y, leafLife);
+
+				generateLeaves(conf, skeleton, newType, avg_x, avg_y, leafLife, leaf_seed);
 			}
+
+			grid_destroy(b->leafGrid);
+			b->leafGrid = NULL;
+
 			removeBranch(&branchList, turn);
 			if (turn >= branchList.count) {
 				turn = 0;
@@ -1424,23 +1574,16 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 			continue;
 		}
 
-		// do the tree state update
-		updateBranch(conf, objects, myCounters, &branchList.branches[turn], &branchList);
+		updateBranch(conf, skeleton, myCounters, turn, &branchList);
 
 		if (conf->live && conf->proceduralMode) {
-			werase(tempState);
-			overwrite(objects->treeWin, tempState);
-
 			for (int i = 0; i < branchList.count; i++) {
 				struct Branch* b = &branchList.branches[i];
 
-				double lifeRatio = ((double)b->age) / b->totalLife;
-
-				// Skip if branch is already dying/dead or not a main growth branch
-				if (b->type != trunk && b->type != shootLeft && b->type != shootRight) 
+				if (b->type != trunk && b->type != shootLeft && b->type != shootRight)
 					continue;
 
-				unsigned int leaf_seed = b->leaf_seed;
+				double lifeRatio = ((double)b->age) / b->totalLife;
 
 				int avg_x, avg_y;
 				get_average_position(b, &avg_x, &avg_y);
@@ -1451,37 +1594,93 @@ void growTree(struct config *conf, struct ncursesObjects *objects, struct counte
 					dummy >>= 1;
 				}
 
-				int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
-				enum branchType newType = (b->type == trunk) ? dead : dying;
+				int targetLeafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
 
-				generateLeaves(conf, tempState, newType, avg_x, avg_y, leafLife, leaf_seed);
+				if (targetLeafLife != b->leaf_steps_drawn || avg_x != b->leaf_cur_x || avg_y != b->leaf_cur_y) {
+					if (b->leafGrid) {
+						grid_clear(b->leafGrid);
+						b->leafGrid->anchor_x = avg_x - 20;
+						b->leafGrid->anchor_y = avg_y - 20;
+					} else {
+						b->leafGrid = grid_create(40, 40, avg_x - 20, avg_y - 20);
+					}
+
+					enum branchType newType = (b->type == trunk) ? dead : dying;
+
+					if (debugLog && b->history_count == 0) fprintf(debugLog, "[growTree LIVE] zero-history branch type=%d life=%d age=%d pos=(%d,%d) -> avg=(%d,%d) leafLife=%d\n",
+						b->type, b->life, b->age, b->x, b->y, avg_x, avg_y, targetLeafLife);
+
+					generateLeaves(conf, b->leafGrid, newType, avg_x, avg_y, targetLeafLife, b->leaf_seed);
+
+					b->leaf_steps_drawn = targetLeafLife;
+					b->leaf_cur_x = avg_x;
+					b->leaf_cur_y = avg_y;
+				}
 			}
 		}
 
 		turn = (turn + 1) % branchList.count;
-		
-		if (conf->live && !(conf->load && myCounters->globalTime < conf->targetGlobalTime)) {
-			if (checkKeyPress(conf, myCounters) == 1) {
-				freeBranchList(&branchList);
 
-				if (tempState) {
-					del_panel(tempPanel);
-					delwin(tempState);
+		if (conf->live && !(conf->load && myCounters->globalTime < conf->targetGlobalTime)) {
+			if (!conf->no_disp) {
+				blitTree(skeleton, &branchList, objects, off_x, off_y);
+				if (conf->verbosity > 0) {
+					struct Branch *db = &branchList.branches[turn > 0 ? turn - 1 : 0];
+					mvwprintw(objects->treeWin, 2, 5, "maxX: %03d, maxY: %03d", maxX, maxY);
+					mvwprintw(objects->treeWin, 5, 5, "dx: %02d", db->dx);
+					mvwprintw(objects->treeWin, 6, 5, "dy: %02d", db->dy);
+					mvwprintw(objects->treeWin, 7, 5, "type: %d", db->type);
+					mvwprintw(objects->treeWin, 8, 5, "shootCooldown: % 3d", db->shootCooldown);
+					mvwprintw(objects->treeWin, 9, 5, "globalTime: %llu", myCounters->globalTime);
+					mvwprintw(objects->treeWin, 10, 5, "seed: %u", conf->seed);
 				}
-				return;
+				update_panels();
+				doupdate();
 			}
 
-			if (!conf->no_disp && delayWithKeyCheck(conf, myCounters, objects, conf->timeStep)) quit(conf, objects, 0);
+			float remaining = conf->timeStep;
+			while (remaining > 0 && !conf->no_disp) {
+				float sleepTime = (remaining > 0.2f) ? 0.2f : remaining;
+
+				if (conf->messageTimeout > 0 && conf->message != NULL && objects->messagePanel != NULL) {
+					if (time(NULL) - conf->messageStartTime >= conf->messageTimeout) {
+						clearMessage(objects);
+						conf->message = NULL;
+					}
+				}
+
+				struct timespec ts;
+				ts.tv_sec = (time_t)(sleepTime);
+				ts.tv_nsec = (long)((sleepTime - ts.tv_sec) * 1000000000);
+				nanosleep(&ts, NULL);
+
+				int key = checkKeyPress(conf, myCounters);
+				if (key == 1) {
+					freeBranchList(&branchList);
+					grid_destroy(skeleton);
+					quit(conf, objects, 0);
+				}
+				if (key == 2) {
+					handleResize(conf, objects, trunk_x, trunk_y, baseHeight, &off_x, &off_y);
+					blitTree(skeleton, &branchList, objects, off_x, off_y);
+					update_panels();
+					doupdate();
+				}
+
+				remaining -= sleepTime;
+			}
 		}
 	}
-	
-	freeBranchList(&branchList);
 
-	// display changes
 	if (!conf->no_disp) {
+		blitTree(skeleton, &branchList, objects, off_x, off_y);
 		update_panels();
 		doupdate();
 	}
+
+	freeBranchList(&branchList);
+
+	grid_destroy(skeleton);
 }
 
 // print stdscr to terminal window
@@ -1569,6 +1768,9 @@ char* createDefaultCachePath(void) {
 int main(int argc, char* argv[]) {
 	setlocale(LC_ALL, "");
 
+	debugLog = fopen("/tmp/cbonsai_debug.log", "w");
+	if (debugLog) fprintf(debugLog, "=== cbonsai debug log ===\n");
+
 	struct config conf = {	// defaults
 		.live = 0,
 		.infinite = 0,
@@ -1621,7 +1823,7 @@ int main(int argc, char* argv[]) {
 		{0, 0, 0, 0}
 	};
 
-	struct ncursesObjects objects = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+	struct ncursesObjects objects = {0};
 
 	char leavesInput[128] = "█,█,█,▒,▒";
 
@@ -1863,10 +2065,11 @@ int main(int argc, char* argv[]) {
 		if (conf.load) conf.targetGlobalTime = 0;
 		if (conf.infinite) {
 			timeout(conf.timeWait * 1000);
-			if (checkKeyPress(&conf, &myCounters) == 1)
+			int key = checkKeyPress(&conf, &myCounters);
+			if (key == 1)
 				quit(&conf, &objects, 0);
+			// key == 2 (resize): next iteration calls init() which rebuilds windows
 
-			// seed random number generator
 			conf.seed = time(NULL);
 			srand(conf.seed);
 		}
