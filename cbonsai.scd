@@ -59,6 +59,9 @@ cbonsai is an advanced bonsai tree generator with seasonal color changes, proced
 *-s*, *--seed*=_INT_
 	seed random number generator
 
+*--engine*=_INT_
+	tree generation engine version for new trees (1 or 2) [default: 2]. Trees loaded with -C always use the engine version recorded in their save file, so previously saved trees keep their original look.
+
 *-W*, *--save*=_FILE_
 	save progress to file [default: ~/.cache/cbonsai]
 
@@ -101,6 +104,9 @@ Display a tree with a message that disappears after 10 seconds:
 
 *Enhanced Growth Algorithm*
 	Sophisticated branching logic with age-based behavior, trunk splitting, and dynamic branch lifecycle management.
+
+*Versioned Engines*
+	The growth algorithm is versioned. Save files record the engine version they were created with, and loading replays the tree under that same engine, so saved trees are never reshaped by algorithm updates.
 
 # FILES
 

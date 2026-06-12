@@ -18,6 +18,12 @@ _cbonsai()
     '--screensaver'
     '-m'
     '--message'
+    '-T'
+    '--msgtime'
+    '-P'
+    '--procedural'
+    '-N'
+    '--name'
     '-b'
     '--base'
     '-c'
@@ -30,6 +36,7 @@ _cbonsai()
     '--print'
     '-s'
     '--seed'
+    '--engine'
     '-W'
     '--save'
     '-C'
@@ -45,7 +52,11 @@ _cbonsai()
       COMPREPLY=($(compgen -f -- "$cur"))
       return
       ;;
-    -[twmbcMLs]|--time|--wait|--message|--base|--leaf|--multiplier|--life|--seed)
+    --engine)
+      COMPREPLY=($(compgen -W "1 2" -- "$cur"))
+      return
+      ;;
+    -[twmTNbcMLs]|--time|--wait|--message|--msgtime|--name|--base|--leaf|--multiplier|--life|--seed)
       return
       ;;
   esac

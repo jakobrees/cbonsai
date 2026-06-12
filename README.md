@@ -31,7 +31,7 @@ This version includes major enhancements and new features developed by Jakob Ree
 gcc -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-qual -pedantic \
     -I$(brew --prefix)/opt/ncurses/include \
     -L$(brew --prefix)/opt/ncurses/lib \
-    cbonsai.c -o cbonsai \
+    cbonsai.c msaw.c -o cbonsai \
     $(brew --prefix)/opt/ncurses/lib/libncurses.a \
     $(brew --prefix)/opt/ncurses/lib/libpanel.a
 ```
@@ -98,6 +98,9 @@ Options:
   -L, --life=INT         life; higher -> more growth (0-200) [default: 120]
   -p, --print            print tree to terminal when finished
   -s, --seed=INT         seed random number generator
+      --engine=INT       tree generation engine version for new trees
+                           (1 or 2) [default: 2]; loaded trees use
+                           their saved version
   -W, --save=FILE        save progress to file [default: ~/.cache/cbonsai]
   -C, --load=FILE        load progress from file [default: ~/.cache/cbonsai]
   -v, --verbose          increase output verbosity

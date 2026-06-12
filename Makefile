@@ -49,9 +49,9 @@ endif
 # Main targets
 all: cbonsai
 
-cbonsai: cbonsai.c
+cbonsai: cbonsai.c msaw.c msaw.h
 	@echo "Building cbonsai..."
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS) $(LDLIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) cbonsai.c msaw.c -o $@ $(LDFLAGS) $(LDLIBS)
 
 cbonsai.6: cbonsai.scd
 ifeq ($(shell command -v scdoc 2>/dev/null),)
