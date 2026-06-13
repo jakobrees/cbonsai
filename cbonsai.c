@@ -16,19 +16,11 @@
 
 #include "msaw.h"
 
-#define BRANCH_HISTORY 3 // moving average for proceedural leaves
 
-// v2+ engines draw growth and cosmetics from separate msaw streams so
-// cosmetic tweaks can never change a saved tree's structure; the cosmetic
-// stream is decorrelated from the growth stream by this salt
-#define MSAW_COSMETIC_SALT 0x9E3779B97F4A7C15ULL
-// salt for the trunk-widening animation stream (presentation only — never
-// touches growth/cosmetic, so widen timing can't change a saved tree)
-#define MSAW_WIDEN_SALT 0xD1B54A32D192ED03ULL
-// salt for the deadwood (jin/shari) decision stream. Kept off the growth
-// stream so trees that grow no dead limb stay byte-identical; a tree only
-// diverges where a dead fork actually appears.
-#define MSAW_DEADWOOD_SALT 0xBF58476D1CE4E5B9ULL
+// ==========================================================================
+// TUNABLE PARAMETERS  (aesthetic / behaviour knobs — safe to retune)
+// ==========================================================================
+
 // 1-in-N chance that a trunk split spawns a bare deadwood fork
 #define DEADWOOD_CHANCE 8
 
@@ -36,6 +28,7 @@
 // from the trunk so foliage pools into clouds instead of a symmetric mush.
 // Neutral steps drift outward by BIAS; inward drift is capped at INWARD.
 #define LEAF_PAD_BIAS   1
+
 #define LEAF_PAD_INWARD 1
 
 // v2 lean: trunks and shoots carry a signed bias that pulls their wander
@@ -44,6 +37,7 @@
 // clamped to MAX so the pull (probability |lean|/LEAN_DENOM per step) stays
 // organic rather than a rigid diagonal.
 #define LEAN_MAX   4
+
 #define LEAN_DENOM 4
 
 // v2 crowding gate: a trunk won't split / a shoot won't sprout if another live
@@ -51,6 +45,7 @@
 // bites where heads are packed (high multiplier), so sparse low-M trees are
 // untouched. Trunks want more breathing room than shoots.
 #define SPLIT_MIN_DIST 10
+
 #define SHOOT_MIN_DIST 10
 
 // v2 shoot side-runs: shoots stay on one flank for a short run, then flip, so
@@ -78,8 +73,11 @@
 // extra height, capped at TRUNK_MAX_HALF — so the trunk fattens as it matures.
 // The taper then drops the half-width by one every TRUNK_TAPER_DIV rows up.
 #define TRUNK_MAX_HALF    3
+
 #define TRUNK_TAPER_DIV   6
+
 #define TRUNK_MIN_HEIGHT  14
+
 #define TRUNK_GROW_DIV    12
 
 // v2: a trunk pays this much life per row it climbs (instead of per tick), so
@@ -87,6 +85,32 @@
 // high-M trunk just spends more time wandering sideways between rises. Raise
 // it for shorter trees, lower for taller.
 #define TRUNK_RISE_COST   4
+
+
+// ==========================================================================
+// INTERNAL CONSTANTS  (not aesthetic knobs — changing these alters output / determinism)
+// ==========================================================================
+
+#define BRANCH_HISTORY 3 // moving average for proceedural leaves
+
+// v2+ engines draw growth and cosmetics from separate msaw streams so
+// cosmetic tweaks can never change a saved tree's structure; the cosmetic
+// stream is decorrelated from the growth stream by this salt
+#define MSAW_COSMETIC_SALT 0x9E3779B97F4A7C15ULL
+
+// salt for the trunk-widening animation stream (presentation only — never
+// touches growth/cosmetic, so widen timing can't change a saved tree)
+#define MSAW_WIDEN_SALT 0xD1B54A32D192ED03ULL
+
+// salt for the deadwood (jin/shari) decision stream. Kept off the growth
+// stream so trees that grow no dead limb stay byte-identical; a tree only
+// diverges where a dead fork actually appears.
+#define MSAW_DEADWOOD_SALT 0xBF58476D1CE4E5B9ULL
+
+
+// ==========================================================================
+// TYPES  (hoisted: every struct/enum precedes all functions)
+// ==========================================================================
 
 enum branchType {trunk, shootLeft, shootRight, dying, dead};
 
@@ -155,6 +179,215 @@ struct ColorResult {
 	attr_t attrs;
 	short color_pair;
 };
+
+struct counters {
+	int trunks;
+	int branches;
+	int shoots;
+	int shootCounter;
+	int trunkSplitCooldown;
+	int shootSide;          // v2: current committed shoot flank (shootLeft/shootRight)
+	int shootRunRemaining;  // v2: shoots left on this flank before it flips
+	unsigned long long globalTime;
+};
+
+// Structure to hold RGB values
+struct ColorRGB {
+	int r, g, b;
+	int r_2, g_2, b_2;
+};
+
+// Define season colors
+struct ColorRGB season_colors[5] = {
+	{.r=350, .g=800, .b=350,	// Spring: Light green
+	.r_2=500, .g_2=800, .b_2=500},
+	{.r=0, .g=700, .b=0,		// Summer: Deep green
+	.r_2=0, .g_2=520, .b_2=0},
+    {.r=1000, .g=900, .b=80,	// Early Fall: Yellow (short period)
+	.r_2=1000, .g_2=600, .b_2=80},
+	{.r=900, .g=100, .b=100,	// Late Fall: Deep red (Japanese maple)
+	.r_2=450, .g_2=50, .b_2=50},
+	{.r=900, .g=900, .b=900,	// Winter: White
+	.r_2=750, .g_2=750, .b_2=750}
+};
+
+enum Season {
+    SPRING,
+    SUMMER,
+    EARLY_FALL,
+    LATE_FALL,
+    WINTER
+};
+
+struct LeafWalker {
+	int x, y;
+	unsigned int seed;	// v1: rand_r stream
+	struct msaw rng;	// v2: per-walker msaw stream
+	int outward;		// v2: canopy-pad bias sign (-1 left, +1 right, 0 none)
+};
+
+struct Branch {
+	int x, y;                   // Current position
+	int dx, dy;                 // Current direction
+	int life;                   // Remaining life
+	int age;                    // Current age
+	enum branchType type;       // Branch type (trunk, shootLeft, etc)
+	int shootCooldown;          // Current shoot cooldown
+	int dripLeafCooldown;       // Current drip leaf cooldown
+	int totalLife;              // Initial life value
+	int multiplier;             // Stored multiplier
+	int lean;                   // v2: signed horizontal growth bias (committed side)
+	int splitDepth;             // v2: how many trunk splits deep this branch is
+	int shootGrace;             // v2: ticks after a split before this trunk shoots again
+	int deadwood;               // v2: jin/shari — currently bare bleached dead wood
+	int diebackLife;            // v2: life at/below which a destined fork dies back (0 = never)
+	unsigned int leaf_seed;		// for proceedural consistency (v1)
+	struct msaw leaf_rng;		// for proceedural consistency (v2)
+	int x_history[BRANCH_HISTORY];          // Circular buffer for last BRANCH_HISTORY x positions
+	int y_history[BRANCH_HISTORY];          // Circular buffer for last BRANCH_HISTORY y positions
+	int history_count;         // How many positions we've stored (max BRANCH_HISTORY)
+	int history_index;         // Current index in circular buffer
+
+	struct VirtualGrid *leafGrid;
+	int leaf_steps_drawn;
+	int leaf_cur_x, leaf_cur_y;
+
+	struct LeafWalker *walkers;
+	int walker_count;
+	int walker_capacity;
+};
+
+struct BranchList {
+	struct Branch* branches;    // Dynamic array of branches
+	int count;                  // Current number of branches
+	int capacity;              // Current capacity of array
+};
+
+/*
+ * Versioned tree generation. The version tag pins the growth algorithm:
+ * a saved tree must replay bit-identically under the engine it was created
+ * with, so each engine owns its full RNG-consuming call chain (growth
+ * deltas, branching decisions, colors, leaf glyphs, leaf walkers). Only
+ * RNG-free plumbing (grids, blitting, resize/input handling, the pot) is
+ * shared between engines.
+ *
+ * v1 is frozen: it consumes the global rand() stream seeded via srand()
+ * and must never be modified. v2+ engines draw from explicit msaw streams.
+ */
+struct TreeEngine {
+	void (*growTree)(struct config *conf, struct ncursesObjects *objects,
+		struct counters *myCounters);
+};
+
+
+// ==========================================================================
+// FORWARD DECLARATIONS
+// ==========================================================================
+
+// common / shared
+struct VirtualGrid* grid_create(int w, int h, int ax, int ay);
+void grid_destroy(struct VirtualGrid *g);
+void grid_clear(struct VirtualGrid *g);
+void grid_grow(struct VirtualGrid *g, int lx, int ly);
+void grid_put(struct VirtualGrid *g, int tx, int ty, const char *str, attr_t attrs, short cpair);
+static struct GridCell *grid_at(struct VirtualGrid *g, int x, int y);
+void grid_blit_to_window(struct VirtualGrid *g, WINDOW *win, int ox, int oy);
+void delObjects(struct ncursesObjects *objects);
+void quit(struct config *conf, struct ncursesObjects *objects, int returnCode);
+int saveToFile(const struct config *conf, unsigned long long globalTime);
+int loadFromFile(struct config *conf);
+void finish(const struct config *conf, struct counters *myCounters);
+void printHelp(void);
+static void grid_put_str(struct VirtualGrid *g, int tx, int ty, const char *str, attr_t attrs, short cpair);
+int getBaseHeight(int baseType);
+void drawBaseToGrid(struct VirtualGrid *grid, int baseType, int trunk_x, int trunk_y);
+void drawPotRim(struct VirtualGrid *grid, int baseType, int trunk_x, int trunk_y,
+				int span_lo, int span_hi);
+void drawWins(struct ncursesObjects *objects);
+static inline int mrand(struct msaw *st, int mod);
+int checkKeyPress(const struct config *conf, struct counters *myCounters);
+void updateScreen(float timeStep);
+static inline int interpolate_color(int color1, int color2, float ratio);
+enum Season get_current_season_with_blend(float *blend_ratio);
+void initBranchList(struct BranchList* list);
+void addBranch(struct BranchList* list, struct Branch branch, struct counters *myCounters);
+void removeBranch(struct BranchList* list, int index);
+void freeBranchList(struct BranchList* list);
+static inline void update_position_history(struct Branch* branch);
+static inline void get_average_position(struct Branch* branch, int* avg_x, int* avg_y);
+static inline int isEarlyTrunk(int age, int totalLife);
+static inline int isYoungTrunk(int age, int totalLife);
+static inline int getBranchRollThreshold(int age, int totalLife, int multiplier);
+void addSpaces(WINDOW* messageWin, int count, int *linePosition, int maxWidth);
+int createMessageWindows(struct ncursesObjects *objects, char* message);
+int drawMessage(struct config *conf, struct ncursesObjects *objects, char* message);
+void clearMessage(struct ncursesObjects *objects);
+void init(struct config *conf, struct ncursesObjects *objects);
+void recalculate_offsets(int trunk_x, int trunk_y, int baseHeight, WINDOW *win, int *ox, int *oy);
+void handleResize(struct config *conf, struct ncursesObjects *objects,
+				  int trunk_x, int trunk_y, int baseHeight, int *off_x, int *off_y);
+void blitTree(struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane, int trunk_y,
+			  struct BranchList *branchList,
+			  struct ncursesObjects *objects, int off_x, int off_y);
+int liveStepDisplay(struct config *conf, struct ncursesObjects *objects,
+					struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
+					struct BranchList *branchList,
+					struct counters *myCounters,
+					int trunk_x, int trunk_y, int baseHeight,
+					int *off_x, int *off_y, int maxX, int maxY, int turn);
+void finalHold(struct config *conf, struct ncursesObjects *objects,
+			   struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
+			   struct BranchList *branchList,
+			   int trunk_x, int trunk_y, int baseHeight, int *off_x, int *off_y);
+
+// v1 engine (frozen)
+static inline void roll(int *dice, int mod);
+struct ColorResult chooseColorResult(enum branchType type);
+void setDeltas(enum branchType type, int life, int totalLife, int age, int multiplier, int *returnDx, int *returnDy);
+char* chooseString(const struct config *conf, enum branchType type, int life, int dx, int dy);
+void updateBranch_v1(struct config *conf, struct VirtualGrid *skeleton,
+				struct counters *myCounters, int branchIdx,
+				struct BranchList* list);
+static void leafStepWalkers(struct config *conf, struct VirtualGrid *grid,
+							enum branchType type, int groundY,
+							struct LeafWalker **walkers, int *count, int *capacity);
+void generateLeaves_v1(struct config *conf, struct VirtualGrid *grid, enum branchType type, int x, int y, int life, unsigned int leaf_seed, int groundY);
+void growTree_v1(struct config *conf, struct ncursesObjects *objects, struct counters *myCounters);
+
+// v2 engine
+struct ColorResult chooseColorResult_v2(enum branchType type, struct msaw *cosmetic);
+static int applyLean(struct msaw *growth, int dx, int lean, int lo, int hi);
+void setDeltas_v2(enum branchType type, int life, int totalLife, int age,
+				  int multiplier, int *returnDx, int *returnDy,
+				  int lean, struct msaw *growth);
+char* chooseString_v2(const struct config *conf, enum branchType type, int life,
+					  int dx, int dy, struct msaw *cosmetic);
+static int structuralCrowded(const struct BranchList *list, int x, int y,
+							 int exceptIdx, int minDist);
+void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
+				struct counters *myCounters, int branchIdx,
+				struct BranchList* list,
+				struct msaw *growth, struct msaw *cosmetic, struct msaw *deadRng);
+static void leafStep_v2(struct config *conf, struct VirtualGrid *grid,
+						enum branchType type, int groundY,
+						struct LeafWalker **walkers, int *count, int *capacity);
+void generateLeaves_v2(struct config *conf, struct VirtualGrid *grid, enum branchType type,
+					   int x, int y, int life, const struct msaw *leafRng, int groundY,
+					   int outward);
+static void advanceTrunkWiden(struct VirtualGrid *tp, int trunk_y, struct msaw *rng);
+static void drawWidenedTrunk(struct VirtualGrid *tp, WINDOW *win,
+							 int trunk_y, int off_x, int off_y);
+void growTree_v2(struct config *conf, struct ncursesObjects *objects, struct counters *myCounters);
+
+// dispatch + entry
+struct TreeEngine get_engine(int version);
+void printstdscr(void);
+char* createDefaultCachePath(void);
+
+
+// ==========================================================================
+// COMMON / SHARED  (grid, colour & season, branch list, message, init, io)
+// ==========================================================================
 
 struct VirtualGrid* grid_create(int w, int h, int ax, int ay) {
 	struct VirtualGrid *g = malloc(sizeof(struct VirtualGrid));
@@ -262,17 +495,6 @@ void grid_blit_to_window(struct VirtualGrid *g, WINDOW *win, int ox, int oy) {
 		}
 	}
 }
-
-struct counters {
-	int trunks;
-	int branches;
-	int shoots;
-	int shootCounter;
-	int trunkSplitCooldown;
-	int shootSide;          // v2: current committed shoot flank (shootLeft/shootRight)
-	int shootRunRemaining;  // v2: shoots left on this flank before it flips
-	unsigned long long globalTime;
-};
 
 void delObjects(struct ncursesObjects *objects) {
 	if (objects->treePanel) del_panel(objects->treePanel);
@@ -557,9 +779,6 @@ void drawWins(struct ncursesObjects *objects) {
 	objects->treePanel = new_panel(objects->treeWin);
 }
 
-// roll (randomize) a given die
-static inline void roll(int *dice, int mod) { *dice = rand() % mod; }
-
 // v2 counterpart of rand() % mod, drawing from an explicit msaw stream
 static inline int mrand(struct msaw *st, int mod) {
 	if (mod < 1) return 0;
@@ -594,34 +813,6 @@ static inline int interpolate_color(int color1, int color2, float ratio) {
 	return color2 * (1.0 - ratio) + color1 * ratio;
 	//return color1 + (int)((color2 - color1) * ratio);
 }
-
-// Structure to hold RGB values
-struct ColorRGB {
-	int r, g, b;
-	int r_2, g_2, b_2;
-};
-
-// Define season colors
-struct ColorRGB season_colors[5] = {
-	{.r=350, .g=800, .b=350,	// Spring: Light green
-	.r_2=500, .g_2=800, .b_2=500},
-	{.r=0, .g=700, .b=0,		// Summer: Deep green
-	.r_2=0, .g_2=520, .b_2=0},
-    {.r=1000, .g=900, .b=80,	// Early Fall: Yellow (short period)
-	.r_2=1000, .g_2=600, .b_2=80},
-	{.r=900, .g=100, .b=100,	// Late Fall: Deep red (Japanese maple)
-	.r_2=450, .g_2=50, .b_2=50},
-	{.r=900, .g=900, .b=900,	// Winter: White
-	.r_2=750, .g_2=750, .b_2=750}
-};
-
-enum Season {
-    SPRING,
-    SUMMER,
-    EARLY_FALL,
-    LATE_FALL,
-    WINTER
-};
 
 enum Season get_current_season_with_blend(float *blend_ratio) {
 	time_t now = time(NULL);
@@ -671,126 +862,11 @@ enum Season get_current_season_with_blend(float *blend_ratio) {
 	}
 
 	if (((float)days_into_transition) / blend_period < 1.0f)
-        *blend_ratio = ((float) days_into_transition) / blend_period;
-    else *blend_ratio = 1.0;
-    return current_season;
+		*blend_ratio = ((float) days_into_transition) / blend_period;
+	else
+		*blend_ratio = 1.0;
+	return current_season;
 }
-
-struct ColorResult chooseColorResult(enum branchType type) {
-	struct ColorResult cr = {0, 0};
-	int r;
-	switch(type) {
-	case trunk:
-		r = rand() % 6;
-		if (r < 3) { cr.attrs = A_BOLD; cr.color_pair = 20; }
-		else if (r < 5) { cr.color_pair = 20; }
-		else { cr.color_pair = 21; }
-		break;
-
-	case shootLeft:
-	case shootRight:
-		r = rand() % 10;
-		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 20; }
-		else if (r < 6) { cr.attrs = A_BOLD; cr.color_pair = 21; }
-		else { cr.color_pair = 21; }
-		break;
-
-	case dying:
-		r = rand() % 6;
-		if (r < 3) { cr.color_pair = 22; }
-		else if (r < 5) { cr.attrs = A_BOLD; cr.color_pair = 22; }
-		else { cr.color_pair = 23; }
-		break;
-
-	case dead:
-		r = rand() % 18;
-		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 23; }
-		else if (r < 8) { cr.attrs = A_BOLD; cr.color_pair = 22; }
-		else { cr.color_pair = 22; }
-		break;
-	}
-	return cr;
-}
-
-struct ColorResult chooseColorResult_v2(enum branchType type, struct msaw *cosmetic) {
-	struct ColorResult cr = {0, 0};
-	int r;
-	switch(type) {
-	case trunk:
-		r = mrand(cosmetic, 4);
-		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 20; }
-		else if (r == 2) { cr.color_pair = 20; }
-		else { cr.color_pair = 21; }
-		break;
-
-	case shootLeft:
-	case shootRight:
-		r = mrand(cosmetic, 10);
-		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 20; }
-		else if (r < 6) { cr.attrs = A_BOLD; cr.color_pair = 21; }
-		else { cr.color_pair = 21; }
-		break;
-
-	case dying:
-		r = mrand(cosmetic, 6);
-		if (r < 3) { cr.color_pair = 22; }
-		else if (r < 5) { cr.attrs = A_BOLD; cr.color_pair = 22; }
-		else { cr.color_pair = 23; }
-		break;
-
-	case dead:
-		r = mrand(cosmetic, 18);
-		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 23; }
-		else if (r < 8) { cr.attrs = A_BOLD; cr.color_pair = 22; }
-		else { cr.color_pair = 22; }
-		break;
-	}
-	return cr;
-}
-
-struct LeafWalker {
-	int x, y;
-	unsigned int seed;	// v1: rand_r stream
-	struct msaw rng;	// v2: per-walker msaw stream
-	int outward;		// v2: canopy-pad bias sign (-1 left, +1 right, 0 none)
-};
-
-struct Branch {
-	int x, y;                   // Current position
-	int dx, dy;                 // Current direction
-	int life;                   // Remaining life
-	int age;                    // Current age
-	enum branchType type;       // Branch type (trunk, shootLeft, etc)
-	int shootCooldown;          // Current shoot cooldown
-	int dripLeafCooldown;       // Current drip leaf cooldown
-	int totalLife;              // Initial life value
-	int multiplier;             // Stored multiplier
-	int lean;                   // v2: signed horizontal growth bias (committed side)
-	int splitDepth;             // v2: how many trunk splits deep this branch is
-	int shootGrace;             // v2: ticks after a split before this trunk shoots again
-	int deadwood;               // v2: jin/shari — currently bare bleached dead wood
-	int diebackLife;            // v2: life at/below which a destined fork dies back (0 = never)
-	unsigned int leaf_seed;		// for proceedural consistency (v1)
-	struct msaw leaf_rng;		// for proceedural consistency (v2)
-	int x_history[BRANCH_HISTORY];          // Circular buffer for last BRANCH_HISTORY x positions
-	int y_history[BRANCH_HISTORY];          // Circular buffer for last BRANCH_HISTORY y positions
-	int history_count;         // How many positions we've stored (max BRANCH_HISTORY)
-	int history_index;         // Current index in circular buffer
-
-	struct VirtualGrid *leafGrid;
-	int leaf_steps_drawn;
-	int leaf_cur_x, leaf_cur_y;
-
-	struct LeafWalker *walkers;
-	int walker_count;
-	int walker_capacity;
-};
-
-struct BranchList {
-	struct Branch* branches;    // Dynamic array of branches
-	int count;                  // Current number of branches
-	int capacity;              // Current capacity of array
-};
 
 void initBranchList(struct BranchList* list) {
 	list->capacity = 16;  // Initial capacity
@@ -830,22 +906,6 @@ void freeBranchList(struct BranchList* list) {
 	list->capacity = 0;
 }
 
-/*
- * Versioned tree generation. The version tag pins the growth algorithm:
- * a saved tree must replay bit-identically under the engine it was created
- * with, so each engine owns its full RNG-consuming call chain (growth
- * deltas, branching decisions, colors, leaf glyphs, leaf walkers). Only
- * RNG-free plumbing (grids, blitting, resize/input handling, the pot) is
- * shared between engines.
- *
- * v1 is frozen: it consumes the global rand() stream seeded via srand()
- * and must never be modified. v2+ engines draw from explicit msaw streams.
- */
-struct TreeEngine {
-	void (*growTree)(struct config *conf, struct ncursesObjects *objects,
-		struct counters *myCounters);
-};
-
 static inline void update_position_history(struct Branch* branch) {
 	// Add new position to history
 	branch->x_history[branch->history_index] = branch->x;
@@ -882,6 +942,470 @@ static inline int isEarlyTrunk(int age, int totalLife) {
 // Check if we're in the young trunk phase (first 15% of life)
 static inline int isYoungTrunk(int age, int totalLife) {
 	return age < (totalLife * 3 / 20);  // 15% of total life
+}
+
+// Calculate branching roll threshold based on age (higher number = less likely to branch)
+static inline int getBranchRollThreshold(int age, int totalLife, int multiplier) {
+	// Base dice of 12, lower number = more branching
+	int dice = 3;  // Base roll threshold (1/3 chance)
+
+	if (isYoungTrunk(age, totalLife)) {
+		dice = 12 - (multiplier/10);  // Only 1/12 chance during young phase
+	} else {
+		// We want LESS chance to branch as we go up
+		int remainingLife = totalLife - age;
+
+
+
+		if (remainingLife < totalLife / 4) {  // Near the top
+			dice = 15 - (multiplier/4);  // Base 1/12 chance
+		} else if (remainingLife < totalLife / 2) {  // Upper half
+			dice = 10 - (multiplier/6);  // Base 1/8 chance
+		} else {
+			dice = 5 - (multiplier/10);  // Base 1/4 chance near bottom
+		}
+	}
+	
+	return dice;
+}
+
+void addSpaces(WINDOW* messageWin, int count, int *linePosition, int maxWidth) {
+	// add spaces if there's enough space
+	if (*linePosition < (maxWidth - count)) {
+		/* if (verbosity) mvwprintw(treeWin, 12, 5, "inserting a space: linePosition: %02d", *linePosition); */
+
+		// add spaces up to width
+		for (int j = 0; j < count; j++) {
+			wprintw(messageWin, " ");
+			(*linePosition)++;
+		}
+	}
+}
+
+// create ncurses windows to contain message and message box
+// returns 0 on success, 1 if terminal too small
+int createMessageWindows(struct ncursesObjects *objects, char* message) {
+	int maxY, maxX;
+	getmaxyx(stdscr, maxY, maxX);
+
+	if (maxX < 10 || maxY < 4) {
+		objects->messageBorderWin = NULL;
+		objects->messageWin = NULL;
+		objects->messageBorderPanel = NULL;
+		objects->messagePanel = NULL;
+		return 1;
+	}
+
+	int boxWidth = 0;
+	int boxHeight = 0;
+
+	if (strlen(message) + 3 <= (0.25 * maxX)) {
+		boxWidth = strlen(message) + 1;
+		boxHeight = 1;
+	} else {
+		boxWidth = 0.25 * maxX;
+		if (boxWidth < 4) boxWidth = 4;
+		boxHeight = (strlen(message) / boxWidth) + (strlen(message) / boxWidth);
+	}
+
+	int borderW = boxWidth + 4;
+	int borderH = boxHeight + 2;
+	int borderY = (int)(maxY * 0.3) - 1;
+	int borderX = (int)(maxX * 0.7) - 2;
+
+	if (borderY < 0) borderY = 0;
+	if (borderX < 0) borderX = 0;
+	if (borderX + borderW > maxX) borderW = maxX - borderX;
+	if (borderY + borderH > maxY) borderH = maxY - borderY;
+	if (borderW < 3 || borderH < 3) {
+		objects->messageBorderWin = NULL;
+		objects->messageWin = NULL;
+		objects->messageBorderPanel = NULL;
+		objects->messagePanel = NULL;
+		return 1;
+	}
+
+	int msgW = borderW - 3;
+	int msgH = borderH - 2;
+	int msgY = borderY + 1;
+	int msgX = borderX + 2;
+
+	objects->messageBorderWin = newwin(borderH, borderW, borderY, borderX);
+	objects->messageWin = newwin(msgH, msgW, msgY, msgX);
+
+	wattron(objects->messageBorderWin, COLOR_PAIR(8) | A_BOLD);
+	wborder(objects->messageBorderWin, '|', '|', '-', '-', '+', '+', '+', '+');
+
+	objects->messageBorderPanel = new_panel(objects->messageBorderWin);
+	objects->messagePanel = new_panel(objects->messageWin);
+	return 0;
+}
+
+int drawMessage(struct config *conf, struct ncursesObjects *objects, char* message) {
+	if (!message) return 1;
+
+	conf->messageStartTime = time(NULL);
+	if (createMessageWindows(objects, message) != 0) return 1;
+
+	int maxWidth = getmaxx(objects->messageWin) - 2;
+
+	// word wrap message as it is written
+	unsigned int i = 0;
+	int linePosition = 0;
+	int wordLength = 0;
+	char wordBuffer[512] = {'\0'};
+	char thisChar;
+	while (true) {
+		thisChar = message[i];
+		if (conf->verbosity) {
+			mvwprintw(objects->treeWin, 9, 5, "index: %03d", i);
+			mvwprintw(objects->treeWin, 10, 5, "linePosition: %02d", linePosition);
+		}
+
+		// append this character to word buffer,
+		// if it's not space or NULL and it can fit
+		if (!(isspace(thisChar) || thisChar == '\0') && wordLength < (int) (sizeof(wordBuffer) / sizeof(wordBuffer[0]))) {
+			strncat(wordBuffer, &thisChar, 1);
+			wordLength++;
+			linePosition++;
+		}
+
+		// if char is space or null char
+		else if (isspace(thisChar) || thisChar == '\0') {
+
+			// if current line can fit word, add word to current line
+			if (linePosition <= maxWidth) {
+				wprintw(objects->messageWin, "%s", wordBuffer);	// print word
+				wordLength = 0;		// reset word length
+				wordBuffer[0] = '\0';	// clear word buffer
+
+				switch (thisChar) {
+				case ' ':
+					addSpaces(objects->messageWin, 1, &linePosition, maxWidth);
+					break;
+				case '\t':
+					addSpaces(objects->messageWin, 1, &linePosition, maxWidth);
+					break;
+				case '\n':
+					waddch(objects->messageWin, thisChar);
+					linePosition = 0;
+					break;
+				}
+
+			}
+
+			// if word can't fit within a single line, just print it
+			else if (wordLength > maxWidth) {
+				wprintw(objects->messageWin, "%s ", wordBuffer);	// print word
+				wordLength = 0;		// reset word length
+				wordBuffer[0] = '\0';	// clear word buffer
+
+				// our line position on this new line is the x coordinate
+				int y;
+				(void) y;
+				getyx(objects->messageWin, y, linePosition);
+			}
+
+			// if current line can't fit word, go to next line
+			else {
+				if (conf->verbosity) mvwprintw(objects->treeWin, (i / 24) + 28, 5, "couldn't fit word. linePosition: %02d, wordLength: %02d", linePosition, wordLength);
+				wprintw(objects->messageWin, "\n%s ", wordBuffer); // print newline, then word
+				linePosition = wordLength;	// reset line position
+				wordLength = 0;		// reset word length
+				wordBuffer[0] = '\0';	// clear word buffer
+			}
+		}
+		else {
+			printf("%s", "Error while parsing message");
+			return 1;
+		}
+
+		if (conf->verbosity >= 2) {
+			updateScreen(1);
+			mvwprintw(objects->treeWin, 11, 5, "word buffer: |%15s|", wordBuffer);
+		}
+		if (thisChar == '\0') break;	// quit when we reach the end of the message
+		i++;
+	}
+	return 0;
+}
+
+void clearMessage(struct ncursesObjects *objects) {
+	if (objects->messagePanel) {
+		del_panel(objects->messagePanel);
+		objects->messagePanel = NULL;
+	}
+	if (objects->messageBorderPanel) {
+		del_panel(objects->messageBorderPanel);
+		objects->messageBorderPanel = NULL;
+	}
+	if (objects->messageWin) {
+		delwin(objects->messageWin);
+		objects->messageWin = NULL;
+	}
+	if (objects->messageBorderWin) {
+		delwin(objects->messageBorderWin);
+		objects->messageBorderWin = NULL;
+	}
+
+	// Update display
+	update_panels();
+	doupdate();
+}
+
+void init(struct config *conf, struct ncursesObjects *objects) {
+	savetty();	// save terminal settings
+	initscr();	// init ncurses screen
+	noecho();	// don't echo input to screen
+	curs_set(0);	// make cursor invisible
+	cbreak();	// don't wait for new line to grab user input
+	nodelay(stdscr, TRUE);	// force getch to be a non-blocking call
+
+	// use native background color when possible
+	int bg = COLOR_BLACK;
+	if (use_default_colors() != ERR) bg = -1;
+
+	// if terminal has color capabilities, use them
+	if (has_colors()) {
+		start_color();
+
+		// define color pairs 0-15
+		for(int i=0; i<16; i++){
+			init_pair(i, i, bg);
+		}
+
+		// restrict color palette in non-256color terminals (e.g. screen, cygwin, linux console)
+		if (COLORS < 256) {
+			init_pair(8, 7, bg);	// gray will look white
+			init_pair(9, 1, bg);
+			init_pair(10, 2, bg);
+			init_pair(11, 3, bg);
+			init_pair(12, 4, bg);
+			init_pair(13, 5, bg);
+			init_pair(14, 6, bg);
+			init_pair(15, 7, bg);
+		}
+
+		if (can_change_color() && COLORS >= 256) {
+			// Full 256-color terminal: define custom seasonal RGB colors
+			float blend_ratio;
+			enum Season season = get_current_season_with_blend(&blend_ratio);
+
+			struct ColorRGB current_colors = season_colors[season];
+			struct ColorRGB prev_colors = season_colors[(season + 4) % 5];
+
+			int r   = interpolate_color(current_colors.r,   prev_colors.r,   blend_ratio);
+			int g   = interpolate_color(current_colors.g,   prev_colors.g,   blend_ratio);
+			int b   = interpolate_color(current_colors.b,   prev_colors.b,   blend_ratio);
+			int r_2 = interpolate_color(current_colors.r_2, prev_colors.r_2, blend_ratio);
+			int g_2 = interpolate_color(current_colors.g_2, prev_colors.g_2, blend_ratio);
+			int b_2 = interpolate_color(current_colors.b_2, prev_colors.b_2, blend_ratio);
+
+			init_color(16, 540, 270, 0);     // Lighter brown for trunk
+			init_color(17, 280, 140, 0);     // Darker brown for branches
+			init_color(18, r,   g,   b);     // Main leaf color
+			init_color(19, r_2, g_2, b_2);  // Darker leaf variant
+			init_color(25, 560, 510, 420);  // Weathered deadwood (jin/shari) — muted driftwood
+
+			init_pair(20, 16, bg);  // Trunk color
+			init_pair(21, 17, bg);  // Branch color
+			init_pair(22, 18, bg);  // Leaf color 1
+			init_pair(23, 19, bg);  // Leaf color 2
+			init_pair(24, 25, bg);  // Deadwood (bleached)
+		} else {
+			// Limited terminal (cygwin, screen, linux console, ssh with basic TERM):
+			// fall back to the 8 standard colors, season-aware
+			float blend_ratio;
+			enum Season season = get_current_season_with_blend(&blend_ratio);
+
+			short trunk_color, leaf_color_1, leaf_color_2;
+			switch (season) {
+				case EARLY_FALL:
+					trunk_color  = COLOR_YELLOW;
+					leaf_color_1 = COLOR_YELLOW;
+					leaf_color_2 = COLOR_YELLOW;
+					break;
+				case LATE_FALL:
+					trunk_color  = COLOR_RED;
+					leaf_color_1 = COLOR_RED;
+					leaf_color_2 = COLOR_YELLOW;
+					break;
+				case WINTER:
+					trunk_color  = COLOR_WHITE;
+					leaf_color_1 = COLOR_WHITE;
+					leaf_color_2 = COLOR_WHITE;
+					break;
+				case SPRING:
+				case SUMMER:
+				default:
+					trunk_color  = COLOR_YELLOW;
+					leaf_color_1 = COLOR_GREEN;
+					leaf_color_2 = COLOR_GREEN;
+					break;
+			}
+			init_pair(20, trunk_color,  bg);
+			init_pair(21, trunk_color,  bg);
+			init_pair(22, leaf_color_1, bg);
+			init_pair(23, leaf_color_2, bg);
+			init_pair(24, COLOR_WHITE,  bg);  // Deadwood (bleached -> white)
+		}
+	}
+	// else: no color support at all — pairs remain at defaults, tree renders in terminal's default color
+
+	// define and draw windows, then create panels
+	drawWins(objects);
+	drawMessage(conf, objects, conf->message);
+}
+
+void recalculate_offsets(int trunk_x, int trunk_y, int baseHeight, WINDOW *win, int *ox, int *oy) {
+	int h, w;
+	getmaxyx(win, h, w);
+	*ox = (w / 2) - trunk_x;
+	*oy = (h - 1 - baseHeight) - trunk_y;
+}
+
+void handleResize(struct config *conf, struct ncursesObjects *objects,
+				  int trunk_x, int trunk_y, int baseHeight, int *off_x, int *off_y) {
+	endwin();
+	refresh();
+	drawWins(objects);
+	if (conf->message) {
+		time_t saved = conf->messageStartTime;
+		drawMessage(conf, objects, conf->message);
+		conf->messageStartTime = saved;
+	}
+	recalculate_offsets(trunk_x, trunk_y, baseHeight, objects->treeWin, off_x, off_y);
+}
+
+void blitTree(struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane, int trunk_y,
+			  struct BranchList *branchList,
+			  struct ncursesObjects *objects, int off_x, int off_y) {
+	werase(objects->treeWin);
+	if (trunkPlane)
+		drawWidenedTrunk(trunkPlane, objects->treeWin, trunk_y, off_x, off_y);
+	grid_blit_to_window(skeleton, objects->treeWin, off_x, off_y);
+	for (int i = 0; i < branchList->count; i++) {
+		if (branchList->branches[i].leafGrid)
+			grid_blit_to_window(branchList->branches[i].leafGrid, objects->treeWin, off_x, off_y);
+	}
+}
+
+// One live-mode display step: blit, verbose output, screen update, then
+// sleep conf->timeStep while handling message timeout, quit and resize.
+// RNG-free: shared by all engines. Returns 1 if the user quit (caller
+// must free its state and exit), 0 otherwise.
+int liveStepDisplay(struct config *conf, struct ncursesObjects *objects,
+					struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
+					struct BranchList *branchList,
+					struct counters *myCounters,
+					int trunk_x, int trunk_y, int baseHeight,
+					int *off_x, int *off_y, int maxX, int maxY, int turn) {
+	if (conf->no_disp) return 0;
+
+	blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, *off_x, *off_y);
+	if (conf->verbosity > 0) {
+		struct Branch *db = &branchList->branches[turn > 0 ? turn - 1 : 0];
+		mvwprintw(objects->treeWin, 2, 5, "maxX: %03d, maxY: %03d", maxX, maxY);
+		mvwprintw(objects->treeWin, 5, 5, "dx: %02d", db->dx);
+		mvwprintw(objects->treeWin, 6, 5, "dy: %02d", db->dy);
+		mvwprintw(objects->treeWin, 7, 5, "type: %d", db->type);
+		mvwprintw(objects->treeWin, 8, 5, "shootCooldown: % 3d", db->shootCooldown);
+		mvwprintw(objects->treeWin, 9, 5, "globalTime: %llu", myCounters->globalTime);
+		mvwprintw(objects->treeWin, 10, 5, "seed: %u", conf->seed);
+	}
+	update_panels();
+	doupdate();
+
+	float remaining = conf->timeStep;
+	while (remaining > 0) {
+		float sleepTime = (remaining > 0.2f) ? 0.2f : remaining;
+
+		if (conf->messageTimeout > 0 && conf->message != NULL && objects->messagePanel != NULL) {
+			if (time(NULL) - conf->messageStartTime >= conf->messageTimeout) {
+				clearMessage(objects);
+				conf->message = NULL;
+			}
+		}
+
+		struct timespec ts;
+		ts.tv_sec = (time_t)(sleepTime);
+		ts.tv_nsec = (long)((sleepTime - ts.tv_sec) * 1000000000);
+		nanosleep(&ts, NULL);
+
+		int key = checkKeyPress(conf, myCounters);
+		if (key == 1) return 1;
+		if (key == 2) {
+			handleResize(conf, objects, trunk_x, trunk_y, baseHeight, off_x, off_y);
+			blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, *off_x, *off_y);
+			update_panels();
+			doupdate();
+		}
+
+		remaining -= sleepTime;
+	}
+	return 0;
+}
+
+// Hold the finished tree on screen until a real keypress; terminal
+// resizes just re-center and redraw it. RNG-free: shared by all engines.
+void finalHold(struct config *conf, struct ncursesObjects *objects,
+			   struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
+			   struct BranchList *branchList,
+			   int trunk_x, int trunk_y, int baseHeight, int *off_x, int *off_y) {
+	if (conf->no_disp || conf->infinite) return;
+
+	nodelay(stdscr, FALSE);
+	while (wgetch(stdscr) == KEY_RESIZE) {
+		handleResize(conf, objects, trunk_x, trunk_y, baseHeight, off_x, off_y);
+		blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, *off_x, *off_y);
+		update_panels();
+		doupdate();
+	}
+	nodelay(stdscr, TRUE);
+}
+
+
+// ==========================================================================
+// V1 ENGINE  (FROZEN — original global-rand growth; do not modify)
+// ==========================================================================
+
+// roll (randomize) a given die
+static inline void roll(int *dice, int mod) { *dice = rand() % mod; }
+
+struct ColorResult chooseColorResult(enum branchType type) {
+	struct ColorResult cr = {0, 0};
+	int r;
+	switch(type) {
+	case trunk:
+		r = rand() % 6;
+		if (r < 3) { cr.attrs = A_BOLD; cr.color_pair = 20; }
+		else if (r < 5) { cr.color_pair = 20; }
+		else { cr.color_pair = 21; }
+		break;
+
+	case shootLeft:
+	case shootRight:
+		r = rand() % 10;
+		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 20; }
+		else if (r < 6) { cr.attrs = A_BOLD; cr.color_pair = 21; }
+		else { cr.color_pair = 21; }
+		break;
+
+	case dying:
+		r = rand() % 6;
+		if (r < 3) { cr.color_pair = 22; }
+		else if (r < 5) { cr.attrs = A_BOLD; cr.color_pair = 22; }
+		else { cr.color_pair = 23; }
+		break;
+
+	case dead:
+		r = rand() % 18;
+		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 23; }
+		else if (r < 8) { cr.attrs = A_BOLD; cr.color_pair = 22; }
+		else { cr.color_pair = 22; }
+		break;
+	}
+	return cr;
 }
 
 // determine change in X and Y coordinates of a given branch
@@ -1004,151 +1528,6 @@ void setDeltas(enum branchType type, int life, int totalLife, int age, int multi
 	*returnDy = dy;
 }
 
-// v2: nudge a freshly-rolled dx toward the branch's committed lean. Higher
-// |lean| -> more consistent pull; dx is held within [lo, hi] so the lean bends
-// the wander rather than overriding it. Draws one value from the growth stream.
-static int applyLean(struct msaw *growth, int dx, int lean, int lo, int hi) {
-	if (lean == 0) return dx;
-	int s = (lean > 0) ? 1 : -1;
-	int strength = (lean > 0) ? lean : -lean;
-	if (strength > LEAN_MAX) strength = LEAN_MAX;
-	if (mrand(growth, LEAN_DENOM) < strength) {
-		dx += s;
-		if (dx < lo) dx = lo;
-		if (dx > hi) dx = hi;
-	}
-	return dx;
-}
-
-// v2: ported from setDeltas onto an explicit msaw growth stream, plus a lean
-// pull on the trunk and shoot wander (see applyLean). dying/dead drift is left
-// symmetric here — foliage shaping is handled by the canopy-pad walker bias.
-void setDeltas_v2(enum branchType type, int life, int totalLife, int age,
-				  int multiplier, int *returnDx, int *returnDy,
-				  int lean, struct msaw *growth) {
-	int dx = 0;
-	int dy = 0;
-	int dice;
-	switch (type) {
-	case trunk: // trunk
-
-		// new or dead trunk
-		if (age <= 2 || life < 4) {
-			dy = 0;
-			dx = mrand(growth, 3) - 1;
-		}
-		// young trunk should grow wide]
-		else if (isYoungTrunk(age, totalLife)) {
-			// every (multiplier * 0.4) steps, raise tree to next level
-			int step = (int)(multiplier * 0.6);
-			if (step < 1) step = 1;
-			if (age % step == 0) dy = -1;
-			else dy = 0;
-
-			dice = mrand(growth, 10);
-			if (dice >= 0 && dice <=0) dx = -2;			// 10%
-			else if (dice >= 1 && dice <= 3) dx = -1;	// 30%
-			else if (dice >= 4 && dice <= 5) dx = 0;	// 20%
-			else if (dice >= 6 && dice <= 8) dx = 1;	// 30%
-			else if (dice >= 9 && dice <= 9) dx = 2;	// 10%
-		}
-		else if (isEarlyTrunk(age, totalLife)) {
-			// every (multiplier * 0.3) steps, raise tree to next level
-			int step = (int)(multiplier * 0.3);
-			if (step < 1) step = 1;
-			if (age % step == 0) dy = -1;
-			else dy = 0;
-
-			dice = mrand(growth, 10);
-			if (dice >= 0 && dice <=0) dx = -2;			// 10%
-			else if (dice >= 1 && dice <= 3) dx = -1;	// 30%
-			else if (dice >= 4 && dice <= 5) dx = 0;	// 20%
-			else if (dice >= 6 && dice <= 8) dx = 1;	// 30%
-			else if (dice >= 9 && dice <= 9) dx = 2;	// 10%
-		}
-		// old-aged trunk
-		else {
-			dice = mrand(growth, 10);
-			if (dice > 3) dy = -1;
-			else dy = 0;
-
-			dice = mrand(growth, 20);
-			if (dice >= 0 && dice <=0) dx = -2;			// 10%
-			else if (dice >= 1 && dice <= 7) dx = -1;	// 30%
-			else if (dice >= 8 && dice <= 12) dx = 0;	// 20%
-			else if (dice >= 13 && dice <= 18) dx = 1;	// 30%
-			else if (dice >= 19 && dice <= 19) dx = 2;	// 10%
-		}
-		break;
-
-	case 1: // left shoot: trend left and little vertical movement
-		dice = mrand(growth, 10);
-		if (dice >= 0 && dice <= 2) dy = -1;
-		else if (dice >= 3 && dice <= 7) dy = 0;
-		else if (dice >= 8 && dice <= 9) dy = 1;
-
-		dice = mrand(growth, 10);
-		if (dice >= 0 && dice <=1) dx = -2;
-		else if (dice >= 2 && dice <= 5) dx = -1;
-		else if (dice >= 6 && dice <= 8) dx = 0;
-		else if (dice >= 9 && dice <= 9) dx = 1;
-		break;
-
-	case 2: // right shoot: trend right and little vertical movement
-		dice = mrand(growth, 10);
-		if (dice >= 0 && dice <= 2) dy = -1;
-		else if (dice >= 3 && dice <= 7) dy = 0;
-		else if (dice >= 8 && dice <= 9) dy = 1;
-
-		dice = mrand(growth, 10);
-		if (dice >= 0 && dice <=1) dx = 2;
-		else if (dice >= 2 && dice <= 5) dx = 1;
-		else if (dice >= 6 && dice <= 8) dx = 0;
-		else if (dice >= 9 && dice <= 9) dx = -1;
-		break;
-
-	case 3: // dying: discourage vertical growth(?); trend left/right (-3,3)
-		dice = mrand(growth, 10);
-		if (dice >= 0 && dice <=0) dy = -1;
-		else if (dice >= 1 && dice <=8) dy = 0;
-		else if (dice >= 9 && dice <=9) dy = 1;
-
-		dice = mrand(growth, 15);
-		if (dice >= 0 && dice <=0) dx = -3;
-		else if (dice >= 1 && dice <= 2) dx = -2;
-		else if (dice >= 3 && dice <= 5) dx = -1;
-		else if (dice >= 6 && dice <= 8) dx = 0;
-		else if (dice >= 9 && dice <= 11) dx = 1;
-		else if (dice >= 12 && dice <= 13) dx = 2;
-		else if (dice >= 14 && dice <= 14) dx = 3;
-		break;
-
-	case 4: // dead: fill in surrounding area
-		dice = mrand(growth, 12);
-		if (dice >= 0 && dice <= 1) dy = -1;
-		else if (dice >= 2 && dice <= 8) dy = 0;
-		else if (dice >= 9 && dice <= 11) dy = 1;
-
-		dice = mrand(growth, 15);
-		if (dice >= 0 && dice <=1) dx = -3;
-		else if (dice >= 2 && dice <= 3) dx = -2;
-		else if (dice >= 4 && dice <= 5) dx = -1;
-		else if (dice >= 6 && dice <= 8) dx = 0;
-		else if (dice >= 9 && dice <= 10) dx = 1;
-		else if (dice >= 11 && dice <= 12) dx = 2;
-		else if (dice >= 13 && dice <= 14) dx = 3;
-		break;
-	}
-
-	// commit the woody wander toward the branch's lean (foliage is shaped by
-	// the canopy-pad bias instead, so dying/dead are left alone)
-	if (type == trunk || type == shootLeft || type == shootRight)
-		dx = applyLean(growth, dx, lean, -2, 2);
-
-	*returnDx = dx;
-	*returnDy = dy;
-}
-
 char* chooseString(const struct config *conf, enum branchType type, int life, int dx, int dy) {
 	char* branchStr;
 
@@ -1187,74 +1566,6 @@ char* chooseString(const struct config *conf, enum branchType type, int life, in
 	}
 
 	return branchStr;
-}
-
-// v2: faithful port of chooseString; leaf glyph choice draws from the
-// cosmetic stream so it can be retuned without invalidating saved trees
-char* chooseString_v2(const struct config *conf, enum branchType type, int life,
-					  int dx, int dy, struct msaw *cosmetic) {
-	char* branchStr;
-
-	const unsigned int maxStrLen = 32;
-
-	branchStr = malloc(maxStrLen);
-	strcpy(branchStr, "?");	// fallback character
-
-	if (life < 4) type = dying;
-
-	switch(type) {
-	case trunk:
-		if (dy == 0) strcpy(branchStr, "/~");
-		else if (dx < 0) strcpy(branchStr, "\\|");
-		else if (dx == 0) strcpy(branchStr, "/|\\");
-		else if (dx > 0) strcpy(branchStr, "|/");
-		break;
-	case shootLeft:
-		if (dy > 0) strcpy(branchStr, "\\");
-		else if (dy == 0) strcpy(branchStr, "\\_");
-		else if (dx < 0) strcpy(branchStr, "\\|");
-		else if (dx == 0) strcpy(branchStr, "/|");
-		else if (dx > 0) strcpy(branchStr, "/");
-		break;
-	case shootRight:
-		if (dy > 0) strcpy(branchStr, "/");
-		else if (dy == 0) strcpy(branchStr, "_/");
-		else if (dx < 0) strcpy(branchStr, "\\|");
-		else if (dx == 0) strcpy(branchStr, "/|");
-		else if (dx > 0) strcpy(branchStr, "/");
-		break;
-	case dying:
-	case dead:
-		strncpy(branchStr, conf->leaves[mrand(cosmetic, conf->leavesSize)], maxStrLen - 1);
-		branchStr[maxStrLen - 1] = '\0';
-	}
-
-	return branchStr;
-}
-
-// Calculate branching roll threshold based on age (higher number = less likely to branch)
-static inline int getBranchRollThreshold(int age, int totalLife, int multiplier) {
-	// Base dice of 12, lower number = more branching
-	int dice = 3;  // Base roll threshold (1/3 chance)
-
-	if (isYoungTrunk(age, totalLife)) {
-		dice = 12 - (multiplier/10);  // Only 1/12 chance during young phase
-	} else {
-		// We want LESS chance to branch as we go up
-		int remainingLife = totalLife - age;
-
-
-
-		if (remainingLife < totalLife / 4) {  // Near the top
-			dice = 15 - (multiplier/4);  // Base 1/12 chance
-		} else if (remainingLife < totalLife / 2) {  // Upper half
-			dice = 10 - (multiplier/6);  // Base 1/8 chance
-		} else {
-			dice = 5 - (multiplier/10);  // Base 1/4 chance near bottom
-		}
-	}
-	
-	return dice;
 }
 
 void updateBranch_v1(struct config *conf, struct VirtualGrid *skeleton,
@@ -1494,6 +1805,510 @@ void updateBranch_v1(struct config *conf, struct VirtualGrid *skeleton,
 	}
 
 	free(branchStr);
+}
+
+static void leafStepWalkers(struct config *conf, struct VirtualGrid *grid,
+							enum branchType type, int groundY,
+							struct LeafWalker **walkers, int *count, int *capacity) {
+	int prev_count = *count;
+	for (int w = 0; w < prev_count; w++) {
+		struct LeafWalker *wk = &(*walkers)[w];
+
+		int dx = 0, dy = 0, dice;
+		switch (type) {
+		case dying:
+			dice = rand_r(&wk->seed) % 10;
+			if (dice >= 0 && dice <= 0) dy = -1;
+			else if (dice >= 1 && dice <= 8) dy = 0;
+			else if (dice >= 9 && dice <= 9) dy = 1;
+
+			dice = rand_r(&wk->seed) % 15;
+			if (dice >= 0 && dice <= 0) dx = -3;
+			else if (dice >= 1 && dice <= 2) dx = -2;
+			else if (dice >= 3 && dice <= 5) dx = -1;
+			else if (dice >= 6 && dice <= 8) dx = 0;
+			else if (dice >= 9 && dice <= 11) dx = 1;
+			else if (dice >= 12 && dice <= 13) dx = 2;
+			else if (dice >= 14 && dice <= 14) dx = 3;
+			break;
+		case dead:
+			dice = rand_r(&wk->seed) % 12;
+			if (dice >= 0 && dice <= 1) dy = -1;
+			else if (dice >= 2 && dice <= 8) dy = 0;
+			else if (dice >= 9 && dice <= 11) dy = 1;
+
+			dice = rand_r(&wk->seed) % 15;
+			if (dice >= 0 && dice <= 1) dx = -3;
+			else if (dice >= 2 && dice <= 3) dx = -2;
+			else if (dice >= 4 && dice <= 5) dx = -1;
+			else if (dice >= 6 && dice <= 8) dx = 0;
+			else if (dice >= 9 && dice <= 10) dx = 1;
+			else if (dice >= 11 && dice <= 12) dx = 2;
+			else if (dice >= 13 && dice <= 14) dx = 3;
+			break;
+		default:
+			break;
+		}
+
+		if (dy > 0 && wk->y > (groundY - 2))
+			dy--;
+
+		unsigned int child_seed = rand_r(&wk->seed);
+		if (*count < 4096) {
+			if (*count >= *capacity) {
+				*capacity *= 2;
+				*walkers = realloc(*walkers, sizeof(struct LeafWalker) * (size_t)*capacity);
+				wk = &(*walkers)[w];
+			}
+			(*walkers)[(*count)++] = (struct LeafWalker){.x = wk->x, .y = wk->y, .seed = child_seed};
+		}
+
+		wk->x += dx;
+		wk->y += dy;
+
+		if (wk->y >= 0 && wk->y < groundY) {
+			attr_t la = 0;
+			short lc = 0;
+			switch (type) {
+			case dying:
+				if (rand_r(&wk->seed) % 6 == 0) { lc = 22; }
+				else if (rand_r(&wk->seed) % 2 == 0) { la = A_BOLD; lc = 23; }
+				else { lc = 23; }
+				break;
+			case dead:
+				if (rand_r(&wk->seed) % 7 == 0) { la = A_BOLD; lc = 22; }
+				else if (rand_r(&wk->seed) % 2 == 0) { la = A_BOLD; lc = 23; }
+				else { lc = 23; }
+				break;
+			default:
+				break;
+			}
+
+			grid_put(grid, wk->x, wk->y, conf->leaves[rand_r(&wk->seed) % conf->leavesSize], la, lc);
+		}
+	}
+}
+
+void generateLeaves_v1(struct config *conf, struct VirtualGrid *grid, enum branchType type, int x, int y, int life, unsigned int leaf_seed, int groundY) {
+	int capacity = 16;
+	int count = 1;
+	struct LeafWalker *walkers = malloc(sizeof(struct LeafWalker) * (size_t)capacity);
+	walkers[0] = (struct LeafWalker){.x = x, .y = y, .seed = leaf_seed};
+
+	for (int step = 0; step < life; step++) {
+		leafStepWalkers(conf, grid, type, groundY, &walkers, &count, &capacity);
+	}
+
+	free(walkers);
+}
+
+// v1 engine: frozen. Consumes the global rand() stream seeded by srand();
+// any change to its rand() call sequence breaks replay of saved v1 trees.
+void growTree_v1(struct config *conf, struct ncursesObjects *objects, struct counters *myCounters) {
+	int maxY, maxX;
+	getmaxyx(objects->treeWin, maxY, maxX);
+
+	int baseHeight = getBaseHeight(conf->baseType);
+	struct VirtualGrid *skeleton = grid_create(maxX, maxY + baseHeight, 0, 0);
+	struct VirtualGrid *trunkPlane = grid_create(maxX, maxY + baseHeight, 0, 0);
+	struct VirtualGrid *renderPlane = NULL;  // v1: never render the widened trunk (frozen look)
+	int trunk_x = maxX / 2;
+	int trunk_y = maxY - 1 - baseHeight;
+	int off_x = 0, off_y = 0;
+	int rimLo = trunk_x, rimHi = trunk_x;
+
+	drawBaseToGrid(skeleton, conf->baseType, trunk_x, trunk_y);
+	drawPotRim(skeleton, conf->baseType, trunk_x, trunk_y, rimLo, rimHi);
+
+	struct BranchList branchList;
+	initBranchList(&branchList);
+
+	myCounters->trunks = 0;
+	myCounters->shoots = 0;
+	myCounters->branches = 0;
+	myCounters->shootCounter = 5;
+	myCounters->globalTime = 0;
+	myCounters->trunkSplitCooldown = 0;
+
+	struct Branch initialBranch = {
+		.x = trunk_x,
+		.y = trunk_y,
+		.life = conf->lifeStart,
+		.age = 0,
+		.type = trunk,
+		.shootCooldown = conf->multiplier,
+		.dripLeafCooldown = conf->multiplier + conf->lifeStart / 4,
+		.totalLife = conf->lifeStart,
+		.multiplier = conf->multiplier
+	};
+	addBranch(&branchList, initialBranch, myCounters);
+
+	int turn = 0;
+	while (branchList.count > 0) {
+		myCounters->globalTime++;
+
+		if (branchList.branches[turn].life <= 0) {
+			struct Branch* b = &branchList.branches[turn];
+			if (conf->proceduralMode &&
+				b->type != dying && b->type != dead &&
+				b->totalLife > 0) {
+				double lifeRatio = ((double)b->age) / b->totalLife;
+				unsigned int leaf_seed = b->leaf_seed;
+
+				int avg_x, avg_y;
+				get_average_position(b, &avg_x, &avg_y);
+
+				int log_factor = 0, dummy = b->age;
+				while(dummy > 0) {
+					log_factor++;
+					dummy >>= 1;
+				}
+
+				int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
+				enum branchType newType = (b->type == trunk) ? dead : dying;
+
+				generateLeaves_v1(conf, skeleton, newType, avg_x, avg_y, leafLife, leaf_seed, trunk_y + 1);
+			}
+
+			free(b->walkers);
+			b->walkers = NULL;
+			b->walker_count = 0;
+			b->walker_capacity = 0;
+			grid_destroy(b->leafGrid);
+			b->leafGrid = NULL;
+
+			removeBranch(&branchList, turn);
+			if (turn >= branchList.count) {
+				turn = 0;
+			}
+			continue;
+		}
+
+		updateBranch_v1(conf, skeleton, myCounters, turn, &branchList);
+
+		// record trunk cells in the trunk plane (tracking only, never
+		// blitted) and keep the pot rim hugging the trunk's footprint
+		{
+			struct Branch *ub = &branchList.branches[turn];
+			if (ub->type == trunk) {
+				grid_put(trunkPlane, ub->x, ub->y, "#", 0, 0);
+				if (ub->y == trunk_y && (ub->x < rimLo || ub->x > rimHi)) {
+					if (ub->x < rimLo) rimLo = ub->x;
+					if (ub->x > rimHi) rimHi = ub->x;
+					drawPotRim(skeleton, conf->baseType, trunk_x, trunk_y, rimLo, rimHi);
+				}
+			}
+		}
+
+		if (conf->live && conf->proceduralMode) {
+			for (int i = 0; i < branchList.count; i++) {
+				struct Branch* b = &branchList.branches[i];
+
+				if (b->type != trunk && b->type != shootLeft && b->type != shootRight)
+					continue;
+				if (b->totalLife <= 0)
+					continue;
+
+				int avg_x, avg_y;
+				get_average_position(b, &avg_x, &avg_y);
+
+				int log_factor = 0, dummy = b->age;
+				while(dummy > 0) {
+					log_factor++;
+					dummy >>= 1;
+				}
+
+				double lifeRatio = ((double)b->age) / b->totalLife;
+				int targetLeafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
+
+				if (!b->walkers) {
+					b->walker_capacity = 16;
+					b->walker_count = 1;
+					b->walkers = malloc(sizeof(struct LeafWalker) * (size_t)b->walker_capacity);
+					b->walkers[0] = (struct LeafWalker){.x = avg_x, .y = avg_y, .seed = b->leaf_seed};
+					b->leaf_steps_drawn = 0;
+					b->leaf_cur_x = avg_x;
+					b->leaf_cur_y = avg_y;
+					b->leafGrid = grid_create(40, 40, avg_x - 20, avg_y - 20);
+				}
+
+				if (avg_x != b->leaf_cur_x || avg_y != b->leaf_cur_y) {
+					int delta_x = avg_x - b->leaf_cur_x;
+					int delta_y = avg_y - b->leaf_cur_y;
+					for (int w = 0; w < b->walker_count; w++) {
+						b->walkers[w].x += delta_x;
+						b->walkers[w].y += delta_y;
+					}
+					b->leafGrid->anchor_x += delta_x;
+					b->leafGrid->anchor_y += delta_y;
+					b->leaf_cur_x = avg_x;
+					b->leaf_cur_y = avg_y;
+				}
+
+				if (b->leaf_steps_drawn < targetLeafLife) {
+					enum branchType leafType = (b->type == trunk) ? dead : dying;
+					leafStepWalkers(conf, b->leafGrid, leafType, trunk_y + 1,
+									&b->walkers, &b->walker_count, &b->walker_capacity);
+					b->leaf_steps_drawn++;
+				}
+			}
+		}
+
+		turn = (turn + 1) % branchList.count;
+
+		if (conf->live && !(conf->load && myCounters->globalTime < conf->targetGlobalTime)) {
+			if (liveStepDisplay(conf, objects, skeleton, renderPlane, &branchList, myCounters,
+								trunk_x, trunk_y, baseHeight, &off_x, &off_y,
+								maxX, maxY, turn)) {
+				freeBranchList(&branchList);
+				grid_destroy(skeleton);
+				grid_destroy(trunkPlane);
+				quit(conf, objects, 0);
+			}
+		}
+	}
+
+	if (!conf->no_disp) {
+		blitTree(skeleton, renderPlane, trunk_y, &branchList, objects, off_x, off_y);
+		update_panels();
+		doupdate();
+	}
+
+	finalHold(conf, objects, skeleton, renderPlane, &branchList, trunk_x, trunk_y, baseHeight, &off_x, &off_y);
+
+	freeBranchList(&branchList);
+
+	grid_destroy(skeleton);
+	grid_destroy(trunkPlane);
+}
+
+
+// ==========================================================================
+// V2 ENGINE  (msaw streams: pads, lean, widening, deadwood)
+// ==========================================================================
+
+struct ColorResult chooseColorResult_v2(enum branchType type, struct msaw *cosmetic) {
+	struct ColorResult cr = {0, 0};
+	int r;
+	switch(type) {
+	case trunk:
+		r = mrand(cosmetic, 4);
+		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 20; }
+		else if (r == 2) { cr.color_pair = 20; }
+		else { cr.color_pair = 21; }
+		break;
+
+	case shootLeft:
+	case shootRight:
+		r = mrand(cosmetic, 10);
+		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 20; }
+		else if (r < 6) { cr.attrs = A_BOLD; cr.color_pair = 21; }
+		else { cr.color_pair = 21; }
+		break;
+
+	case dying:
+		r = mrand(cosmetic, 6);
+		if (r < 3) { cr.color_pair = 22; }
+		else if (r < 5) { cr.attrs = A_BOLD; cr.color_pair = 22; }
+		else { cr.color_pair = 23; }
+		break;
+
+	case dead:
+		r = mrand(cosmetic, 18);
+		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 23; }
+		else if (r < 8) { cr.attrs = A_BOLD; cr.color_pair = 22; }
+		else { cr.color_pair = 22; }
+		break;
+	}
+	return cr;
+}
+
+// v2: nudge a freshly-rolled dx toward the branch's committed lean. Higher
+// |lean| -> more consistent pull; dx is held within [lo, hi] so the lean bends
+// the wander rather than overriding it. Draws one value from the growth stream.
+static int applyLean(struct msaw *growth, int dx, int lean, int lo, int hi) {
+	if (lean == 0) return dx;
+	int s = (lean > 0) ? 1 : -1;
+	int strength = (lean > 0) ? lean : -lean;
+	if (strength > LEAN_MAX) strength = LEAN_MAX;
+	if (mrand(growth, LEAN_DENOM) < strength) {
+		dx += s;
+		if (dx < lo) dx = lo;
+		if (dx > hi) dx = hi;
+	}
+	return dx;
+}
+
+// v2: ported from setDeltas onto an explicit msaw growth stream, plus a lean
+// pull on the trunk and shoot wander (see applyLean). dying/dead drift is left
+// symmetric here — foliage shaping is handled by the canopy-pad walker bias.
+void setDeltas_v2(enum branchType type, int life, int totalLife, int age,
+				  int multiplier, int *returnDx, int *returnDy,
+				  int lean, struct msaw *growth) {
+	int dx = 0;
+	int dy = 0;
+	int dice;
+	switch (type) {
+	case trunk: // trunk
+
+		// new or dead trunk
+		if (age <= 2 || life < 4) {
+			dy = 0;
+			dx = mrand(growth, 3) - 1;
+		}
+		// young trunk should grow wide]
+		else if (isYoungTrunk(age, totalLife)) {
+			// every (multiplier * 0.4) steps, raise tree to next level
+			int step = (int)(multiplier * 0.6);
+			if (step < 1) step = 1;
+			if (age % step == 0) dy = -1;
+			else dy = 0;
+
+			dice = mrand(growth, 10);
+			if (dice >= 0 && dice <=0) dx = -2;			// 10%
+			else if (dice >= 1 && dice <= 3) dx = -1;	// 30%
+			else if (dice >= 4 && dice <= 5) dx = 0;	// 20%
+			else if (dice >= 6 && dice <= 8) dx = 1;	// 30%
+			else if (dice >= 9 && dice <= 9) dx = 2;	// 10%
+		}
+		else if (isEarlyTrunk(age, totalLife)) {
+			// every (multiplier * 0.3) steps, raise tree to next level
+			int step = (int)(multiplier * 0.3);
+			if (step < 1) step = 1;
+			if (age % step == 0) dy = -1;
+			else dy = 0;
+
+			dice = mrand(growth, 10);
+			if (dice >= 0 && dice <=0) dx = -2;			// 10%
+			else if (dice >= 1 && dice <= 3) dx = -1;	// 30%
+			else if (dice >= 4 && dice <= 5) dx = 0;	// 20%
+			else if (dice >= 6 && dice <= 8) dx = 1;	// 30%
+			else if (dice >= 9 && dice <= 9) dx = 2;	// 10%
+		}
+		// old-aged trunk
+		else {
+			dice = mrand(growth, 10);
+			if (dice > 3) dy = -1;
+			else dy = 0;
+
+			dice = mrand(growth, 20);
+			if (dice >= 0 && dice <=0) dx = -2;			// 10%
+			else if (dice >= 1 && dice <= 7) dx = -1;	// 30%
+			else if (dice >= 8 && dice <= 12) dx = 0;	// 20%
+			else if (dice >= 13 && dice <= 18) dx = 1;	// 30%
+			else if (dice >= 19 && dice <= 19) dx = 2;	// 10%
+		}
+		break;
+
+	case 1: // left shoot: trend left and little vertical movement
+		dice = mrand(growth, 10);
+		if (dice >= 0 && dice <= 2) dy = -1;
+		else if (dice >= 3 && dice <= 7) dy = 0;
+		else if (dice >= 8 && dice <= 9) dy = 1;
+
+		dice = mrand(growth, 10);
+		if (dice >= 0 && dice <=1) dx = -2;
+		else if (dice >= 2 && dice <= 5) dx = -1;
+		else if (dice >= 6 && dice <= 8) dx = 0;
+		else if (dice >= 9 && dice <= 9) dx = 1;
+		break;
+
+	case 2: // right shoot: trend right and little vertical movement
+		dice = mrand(growth, 10);
+		if (dice >= 0 && dice <= 2) dy = -1;
+		else if (dice >= 3 && dice <= 7) dy = 0;
+		else if (dice >= 8 && dice <= 9) dy = 1;
+
+		dice = mrand(growth, 10);
+		if (dice >= 0 && dice <=1) dx = 2;
+		else if (dice >= 2 && dice <= 5) dx = 1;
+		else if (dice >= 6 && dice <= 8) dx = 0;
+		else if (dice >= 9 && dice <= 9) dx = -1;
+		break;
+
+	case 3: // dying: discourage vertical growth(?); trend left/right (-3,3)
+		dice = mrand(growth, 10);
+		if (dice >= 0 && dice <=0) dy = -1;
+		else if (dice >= 1 && dice <=8) dy = 0;
+		else if (dice >= 9 && dice <=9) dy = 1;
+
+		dice = mrand(growth, 15);
+		if (dice >= 0 && dice <=0) dx = -3;
+		else if (dice >= 1 && dice <= 2) dx = -2;
+		else if (dice >= 3 && dice <= 5) dx = -1;
+		else if (dice >= 6 && dice <= 8) dx = 0;
+		else if (dice >= 9 && dice <= 11) dx = 1;
+		else if (dice >= 12 && dice <= 13) dx = 2;
+		else if (dice >= 14 && dice <= 14) dx = 3;
+		break;
+
+	case 4: // dead: fill in surrounding area
+		dice = mrand(growth, 12);
+		if (dice >= 0 && dice <= 1) dy = -1;
+		else if (dice >= 2 && dice <= 8) dy = 0;
+		else if (dice >= 9 && dice <= 11) dy = 1;
+
+		dice = mrand(growth, 15);
+		if (dice >= 0 && dice <=1) dx = -3;
+		else if (dice >= 2 && dice <= 3) dx = -2;
+		else if (dice >= 4 && dice <= 5) dx = -1;
+		else if (dice >= 6 && dice <= 8) dx = 0;
+		else if (dice >= 9 && dice <= 10) dx = 1;
+		else if (dice >= 11 && dice <= 12) dx = 2;
+		else if (dice >= 13 && dice <= 14) dx = 3;
+		break;
+	}
+
+	// commit the woody wander toward the branch's lean (foliage is shaped by
+	// the canopy-pad bias instead, so dying/dead are left alone)
+	if (type == trunk || type == shootLeft || type == shootRight)
+		dx = applyLean(growth, dx, lean, -2, 2);
+
+	*returnDx = dx;
+	*returnDy = dy;
+}
+
+// v2: faithful port of chooseString; leaf glyph choice draws from the
+// cosmetic stream so it can be retuned without invalidating saved trees
+char* chooseString_v2(const struct config *conf, enum branchType type, int life,
+					  int dx, int dy, struct msaw *cosmetic) {
+	char* branchStr;
+
+	const unsigned int maxStrLen = 32;
+
+	branchStr = malloc(maxStrLen);
+	strcpy(branchStr, "?");	// fallback character
+
+	if (life < 4) type = dying;
+
+	switch(type) {
+	case trunk:
+		if (dy == 0) strcpy(branchStr, "/~");
+		else if (dx < 0) strcpy(branchStr, "\\|");
+		else if (dx == 0) strcpy(branchStr, "/|\\");
+		else if (dx > 0) strcpy(branchStr, "|/");
+		break;
+	case shootLeft:
+		if (dy > 0) strcpy(branchStr, "\\");
+		else if (dy == 0) strcpy(branchStr, "\\_");
+		else if (dx < 0) strcpy(branchStr, "\\|");
+		else if (dx == 0) strcpy(branchStr, "/|");
+		else if (dx > 0) strcpy(branchStr, "/");
+		break;
+	case shootRight:
+		if (dy > 0) strcpy(branchStr, "/");
+		else if (dy == 0) strcpy(branchStr, "_/");
+		else if (dx < 0) strcpy(branchStr, "\\|");
+		else if (dx == 0) strcpy(branchStr, "/|");
+		else if (dx > 0) strcpy(branchStr, "/");
+		break;
+	case dying:
+	case dead:
+		strncpy(branchStr, conf->leaves[mrand(cosmetic, conf->leavesSize)], maxStrLen - 1);
+		branchStr[maxStrLen - 1] = '\0';
+	}
+
+	return branchStr;
 }
 
 // v2: is a live structural branch head (trunk/shoot, excluding `exceptIdx`)
@@ -1848,389 +2663,6 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 	free(branchStr);
 }
 
-void addSpaces(WINDOW* messageWin, int count, int *linePosition, int maxWidth) {
-	// add spaces if there's enough space
-	if (*linePosition < (maxWidth - count)) {
-		/* if (verbosity) mvwprintw(treeWin, 12, 5, "inserting a space: linePosition: %02d", *linePosition); */
-
-		// add spaces up to width
-		for (int j = 0; j < count; j++) {
-			wprintw(messageWin, " ");
-			(*linePosition)++;
-		}
-	}
-}
-
-// create ncurses windows to contain message and message box
-// returns 0 on success, 1 if terminal too small
-int createMessageWindows(struct ncursesObjects *objects, char* message) {
-	int maxY, maxX;
-	getmaxyx(stdscr, maxY, maxX);
-
-	if (maxX < 10 || maxY < 4) {
-		objects->messageBorderWin = NULL;
-		objects->messageWin = NULL;
-		objects->messageBorderPanel = NULL;
-		objects->messagePanel = NULL;
-		return 1;
-	}
-
-	int boxWidth = 0;
-	int boxHeight = 0;
-
-	if (strlen(message) + 3 <= (0.25 * maxX)) {
-		boxWidth = strlen(message) + 1;
-		boxHeight = 1;
-	} else {
-		boxWidth = 0.25 * maxX;
-		if (boxWidth < 4) boxWidth = 4;
-		boxHeight = (strlen(message) / boxWidth) + (strlen(message) / boxWidth);
-	}
-
-	int borderW = boxWidth + 4;
-	int borderH = boxHeight + 2;
-	int borderY = (int)(maxY * 0.3) - 1;
-	int borderX = (int)(maxX * 0.7) - 2;
-
-	if (borderY < 0) borderY = 0;
-	if (borderX < 0) borderX = 0;
-	if (borderX + borderW > maxX) borderW = maxX - borderX;
-	if (borderY + borderH > maxY) borderH = maxY - borderY;
-	if (borderW < 3 || borderH < 3) {
-		objects->messageBorderWin = NULL;
-		objects->messageWin = NULL;
-		objects->messageBorderPanel = NULL;
-		objects->messagePanel = NULL;
-		return 1;
-	}
-
-	int msgW = borderW - 3;
-	int msgH = borderH - 2;
-	int msgY = borderY + 1;
-	int msgX = borderX + 2;
-
-	objects->messageBorderWin = newwin(borderH, borderW, borderY, borderX);
-	objects->messageWin = newwin(msgH, msgW, msgY, msgX);
-
-	wattron(objects->messageBorderWin, COLOR_PAIR(8) | A_BOLD);
-	wborder(objects->messageBorderWin, '|', '|', '-', '-', '+', '+', '+', '+');
-
-	objects->messageBorderPanel = new_panel(objects->messageBorderWin);
-	objects->messagePanel = new_panel(objects->messageWin);
-	return 0;
-}
-
-int drawMessage(struct config *conf, struct ncursesObjects *objects, char* message) {
-	if (!message) return 1;
-
-	conf->messageStartTime = time(NULL);
-	if (createMessageWindows(objects, message) != 0) return 1;
-
-	int maxWidth = getmaxx(objects->messageWin) - 2;
-
-	// word wrap message as it is written
-	unsigned int i = 0;
-	int linePosition = 0;
-	int wordLength = 0;
-	char wordBuffer[512] = {'\0'};
-	char thisChar;
-	while (true) {
-		thisChar = message[i];
-		if (conf->verbosity) {
-			mvwprintw(objects->treeWin, 9, 5, "index: %03d", i);
-			mvwprintw(objects->treeWin, 10, 5, "linePosition: %02d", linePosition);
-		}
-
-		// append this character to word buffer,
-		// if it's not space or NULL and it can fit
-		if (!(isspace(thisChar) || thisChar == '\0') && wordLength < (int) (sizeof(wordBuffer) / sizeof(wordBuffer[0]))) {
-			strncat(wordBuffer, &thisChar, 1);
-			wordLength++;
-			linePosition++;
-		}
-
-		// if char is space or null char
-		else if (isspace(thisChar) || thisChar == '\0') {
-
-			// if current line can fit word, add word to current line
-			if (linePosition <= maxWidth) {
-				wprintw(objects->messageWin, "%s", wordBuffer);	// print word
-				wordLength = 0;		// reset word length
-				wordBuffer[0] = '\0';	// clear word buffer
-
-				switch (thisChar) {
-				case ' ':
-					addSpaces(objects->messageWin, 1, &linePosition, maxWidth);
-					break;
-				case '\t':
-					addSpaces(objects->messageWin, 1, &linePosition, maxWidth);
-					break;
-				case '\n':
-					waddch(objects->messageWin, thisChar);
-					linePosition = 0;
-					break;
-				}
-
-			}
-
-			// if word can't fit within a single line, just print it
-			else if (wordLength > maxWidth) {
-				wprintw(objects->messageWin, "%s ", wordBuffer);	// print word
-				wordLength = 0;		// reset word length
-				wordBuffer[0] = '\0';	// clear word buffer
-
-				// our line position on this new line is the x coordinate
-				int y;
-				(void) y;
-				getyx(objects->messageWin, y, linePosition);
-			}
-
-			// if current line can't fit word, go to next line
-			else {
-				if (conf->verbosity) mvwprintw(objects->treeWin, (i / 24) + 28, 5, "couldn't fit word. linePosition: %02d, wordLength: %02d", linePosition, wordLength);
-				wprintw(objects->messageWin, "\n%s ", wordBuffer); // print newline, then word
-				linePosition = wordLength;	// reset line position
-				wordLength = 0;		// reset word length
-				wordBuffer[0] = '\0';	// clear word buffer
-			}
-		}
-		else {
-			printf("%s", "Error while parsing message");
-			return 1;
-		}
-
-		if (conf->verbosity >= 2) {
-			updateScreen(1);
-			mvwprintw(objects->treeWin, 11, 5, "word buffer: |%15s|", wordBuffer);
-		}
-		if (thisChar == '\0') break;	// quit when we reach the end of the message
-		i++;
-	}
-	return 0;
-}
-
-void clearMessage(struct ncursesObjects *objects) {
-	if (objects->messagePanel) {
-		del_panel(objects->messagePanel);
-		objects->messagePanel = NULL;
-	}
-	if (objects->messageBorderPanel) {
-		del_panel(objects->messageBorderPanel);
-		objects->messageBorderPanel = NULL;
-	}
-	if (objects->messageWin) {
-		delwin(objects->messageWin);
-		objects->messageWin = NULL;
-	}
-	if (objects->messageBorderWin) {
-		delwin(objects->messageBorderWin);
-		objects->messageBorderWin = NULL;
-	}
-
-	// Update display
-	update_panels();
-	doupdate();
-}
-
-void init(struct config *conf, struct ncursesObjects *objects) {
-	savetty();	// save terminal settings
-	initscr();	// init ncurses screen
-	noecho();	// don't echo input to screen
-	curs_set(0);	// make cursor invisible
-	cbreak();	// don't wait for new line to grab user input
-	nodelay(stdscr, TRUE);	// force getch to be a non-blocking call
-
-	// use native background color when possible
-	int bg = COLOR_BLACK;
-	if (use_default_colors() != ERR) bg = -1;
-
-	// if terminal has color capabilities, use them
-	if (has_colors()) {
-		start_color();
-
-		// define color pairs 0-15
-		for(int i=0; i<16; i++){
-			init_pair(i, i, bg);
-		}
-
-		// restrict color palette in non-256color terminals (e.g. screen, cygwin, linux console)
-		if (COLORS < 256) {
-			init_pair(8, 7, bg);	// gray will look white
-			init_pair(9, 1, bg);
-			init_pair(10, 2, bg);
-			init_pair(11, 3, bg);
-			init_pair(12, 4, bg);
-			init_pair(13, 5, bg);
-			init_pair(14, 6, bg);
-			init_pair(15, 7, bg);
-		}
-
-		if (can_change_color() && COLORS >= 256) {
-			// Full 256-color terminal: define custom seasonal RGB colors
-			float blend_ratio;
-			enum Season season = get_current_season_with_blend(&blend_ratio);
-
-			struct ColorRGB current_colors = season_colors[season];
-			struct ColorRGB prev_colors = season_colors[(season + 4) % 5];
-
-			int r   = interpolate_color(current_colors.r,   prev_colors.r,   blend_ratio);
-			int g   = interpolate_color(current_colors.g,   prev_colors.g,   blend_ratio);
-			int b   = interpolate_color(current_colors.b,   prev_colors.b,   blend_ratio);
-			int r_2 = interpolate_color(current_colors.r_2, prev_colors.r_2, blend_ratio);
-			int g_2 = interpolate_color(current_colors.g_2, prev_colors.g_2, blend_ratio);
-			int b_2 = interpolate_color(current_colors.b_2, prev_colors.b_2, blend_ratio);
-
-			init_color(16, 540, 270, 0);     // Lighter brown for trunk
-			init_color(17, 280, 140, 0);     // Darker brown for branches
-			init_color(18, r,   g,   b);     // Main leaf color
-			init_color(19, r_2, g_2, b_2);  // Darker leaf variant
-			init_color(25, 560, 510, 420);  // Weathered deadwood (jin/shari) — muted driftwood
-
-			init_pair(20, 16, bg);  // Trunk color
-			init_pair(21, 17, bg);  // Branch color
-			init_pair(22, 18, bg);  // Leaf color 1
-			init_pair(23, 19, bg);  // Leaf color 2
-			init_pair(24, 25, bg);  // Deadwood (bleached)
-		} else {
-			// Limited terminal (cygwin, screen, linux console, ssh with basic TERM):
-			// fall back to the 8 standard colors, season-aware
-			float blend_ratio;
-			enum Season season = get_current_season_with_blend(&blend_ratio);
-
-			short trunk_color, leaf_color_1, leaf_color_2;
-			switch (season) {
-				case EARLY_FALL:
-					trunk_color  = COLOR_YELLOW;
-					leaf_color_1 = COLOR_YELLOW;
-					leaf_color_2 = COLOR_YELLOW;
-					break;
-				case LATE_FALL:
-					trunk_color  = COLOR_RED;
-					leaf_color_1 = COLOR_RED;
-					leaf_color_2 = COLOR_YELLOW;
-					break;
-				case WINTER:
-					trunk_color  = COLOR_WHITE;
-					leaf_color_1 = COLOR_WHITE;
-					leaf_color_2 = COLOR_WHITE;
-					break;
-				case SPRING:
-				case SUMMER:
-				default:
-					trunk_color  = COLOR_YELLOW;
-					leaf_color_1 = COLOR_GREEN;
-					leaf_color_2 = COLOR_GREEN;
-					break;
-			}
-			init_pair(20, trunk_color,  bg);
-			init_pair(21, trunk_color,  bg);
-			init_pair(22, leaf_color_1, bg);
-			init_pair(23, leaf_color_2, bg);
-			init_pair(24, COLOR_WHITE,  bg);  // Deadwood (bleached -> white)
-		}
-	}
-	// else: no color support at all — pairs remain at defaults, tree renders in terminal's default color
-
-	// define and draw windows, then create panels
-	drawWins(objects);
-	drawMessage(conf, objects, conf->message);
-}
-
-static void leafStepWalkers(struct config *conf, struct VirtualGrid *grid,
-							enum branchType type, int groundY,
-							struct LeafWalker **walkers, int *count, int *capacity) {
-	int prev_count = *count;
-	for (int w = 0; w < prev_count; w++) {
-		struct LeafWalker *wk = &(*walkers)[w];
-
-		int dx = 0, dy = 0, dice;
-		switch (type) {
-		case dying:
-			dice = rand_r(&wk->seed) % 10;
-			if (dice >= 0 && dice <= 0) dy = -1;
-			else if (dice >= 1 && dice <= 8) dy = 0;
-			else if (dice >= 9 && dice <= 9) dy = 1;
-
-			dice = rand_r(&wk->seed) % 15;
-			if (dice >= 0 && dice <= 0) dx = -3;
-			else if (dice >= 1 && dice <= 2) dx = -2;
-			else if (dice >= 3 && dice <= 5) dx = -1;
-			else if (dice >= 6 && dice <= 8) dx = 0;
-			else if (dice >= 9 && dice <= 11) dx = 1;
-			else if (dice >= 12 && dice <= 13) dx = 2;
-			else if (dice >= 14 && dice <= 14) dx = 3;
-			break;
-		case dead:
-			dice = rand_r(&wk->seed) % 12;
-			if (dice >= 0 && dice <= 1) dy = -1;
-			else if (dice >= 2 && dice <= 8) dy = 0;
-			else if (dice >= 9 && dice <= 11) dy = 1;
-
-			dice = rand_r(&wk->seed) % 15;
-			if (dice >= 0 && dice <= 1) dx = -3;
-			else if (dice >= 2 && dice <= 3) dx = -2;
-			else if (dice >= 4 && dice <= 5) dx = -1;
-			else if (dice >= 6 && dice <= 8) dx = 0;
-			else if (dice >= 9 && dice <= 10) dx = 1;
-			else if (dice >= 11 && dice <= 12) dx = 2;
-			else if (dice >= 13 && dice <= 14) dx = 3;
-			break;
-		default:
-			break;
-		}
-
-		if (dy > 0 && wk->y > (groundY - 2))
-			dy--;
-
-		unsigned int child_seed = rand_r(&wk->seed);
-		if (*count < 4096) {
-			if (*count >= *capacity) {
-				*capacity *= 2;
-				*walkers = realloc(*walkers, sizeof(struct LeafWalker) * (size_t)*capacity);
-				wk = &(*walkers)[w];
-			}
-			(*walkers)[(*count)++] = (struct LeafWalker){.x = wk->x, .y = wk->y, .seed = child_seed};
-		}
-
-		wk->x += dx;
-		wk->y += dy;
-
-		if (wk->y >= 0 && wk->y < groundY) {
-			attr_t la = 0;
-			short lc = 0;
-			switch (type) {
-			case dying:
-				if (rand_r(&wk->seed) % 6 == 0) { lc = 22; }
-				else if (rand_r(&wk->seed) % 2 == 0) { la = A_BOLD; lc = 23; }
-				else { lc = 23; }
-				break;
-			case dead:
-				if (rand_r(&wk->seed) % 7 == 0) { la = A_BOLD; lc = 22; }
-				else if (rand_r(&wk->seed) % 2 == 0) { la = A_BOLD; lc = 23; }
-				else { lc = 23; }
-				break;
-			default:
-				break;
-			}
-
-			grid_put(grid, wk->x, wk->y, conf->leaves[rand_r(&wk->seed) % conf->leavesSize], la, lc);
-		}
-	}
-}
-
-void generateLeaves_v1(struct config *conf, struct VirtualGrid *grid, enum branchType type, int x, int y, int life, unsigned int leaf_seed, int groundY) {
-	int capacity = 16;
-	int count = 1;
-	struct LeafWalker *walkers = malloc(sizeof(struct LeafWalker) * (size_t)capacity);
-	walkers[0] = (struct LeafWalker){.x = x, .y = y, .seed = leaf_seed};
-
-	for (int step = 0; step < life; step++) {
-		leafStepWalkers(conf, grid, type, groundY, &walkers, &count, &capacity);
-	}
-
-	free(walkers);
-}
-
 // v2: faithful port of leafStepWalkers; each walker advances its own msaw
 // stream (replacing rand_r) and children fork via msaw_split
 static void leafStep_v2(struct config *conf, struct VirtualGrid *grid,
@@ -2347,26 +2779,6 @@ void generateLeaves_v2(struct config *conf, struct VirtualGrid *grid, enum branc
 	}
 
 	free(walkers);
-}
-
-void recalculate_offsets(int trunk_x, int trunk_y, int baseHeight, WINDOW *win, int *ox, int *oy) {
-	int h, w;
-	getmaxyx(win, h, w);
-	*ox = (w / 2) - trunk_x;
-	*oy = (h - 1 - baseHeight) - trunk_y;
-}
-
-void handleResize(struct config *conf, struct ncursesObjects *objects,
-				  int trunk_x, int trunk_y, int baseHeight, int *off_x, int *off_y) {
-	endwin();
-	refresh();
-	drawWins(objects);
-	if (conf->message) {
-		time_t saved = conf->messageStartTime;
-		drawMessage(conf, objects, conf->message);
-		conf->messageStartTime = saved;
-	}
-	recalculate_offsets(trunk_x, trunk_y, baseHeight, objects->treeWin, off_x, off_y);
 }
 
 // v2: advance the trunk-widening animation by one tick. Each trunk cell grows
@@ -2506,273 +2918,6 @@ static void drawWidenedTrunk(struct VirtualGrid *tp, WINDOW *win,
 			}
 		}
 	}
-}
-
-void blitTree(struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane, int trunk_y,
-			  struct BranchList *branchList,
-			  struct ncursesObjects *objects, int off_x, int off_y) {
-	werase(objects->treeWin);
-	if (trunkPlane)
-		drawWidenedTrunk(trunkPlane, objects->treeWin, trunk_y, off_x, off_y);
-	grid_blit_to_window(skeleton, objects->treeWin, off_x, off_y);
-	for (int i = 0; i < branchList->count; i++) {
-		if (branchList->branches[i].leafGrid)
-			grid_blit_to_window(branchList->branches[i].leafGrid, objects->treeWin, off_x, off_y);
-	}
-}
-
-// One live-mode display step: blit, verbose output, screen update, then
-// sleep conf->timeStep while handling message timeout, quit and resize.
-// RNG-free: shared by all engines. Returns 1 if the user quit (caller
-// must free its state and exit), 0 otherwise.
-int liveStepDisplay(struct config *conf, struct ncursesObjects *objects,
-					struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
-					struct BranchList *branchList,
-					struct counters *myCounters,
-					int trunk_x, int trunk_y, int baseHeight,
-					int *off_x, int *off_y, int maxX, int maxY, int turn) {
-	if (conf->no_disp) return 0;
-
-	blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, *off_x, *off_y);
-	if (conf->verbosity > 0) {
-		struct Branch *db = &branchList->branches[turn > 0 ? turn - 1 : 0];
-		mvwprintw(objects->treeWin, 2, 5, "maxX: %03d, maxY: %03d", maxX, maxY);
-		mvwprintw(objects->treeWin, 5, 5, "dx: %02d", db->dx);
-		mvwprintw(objects->treeWin, 6, 5, "dy: %02d", db->dy);
-		mvwprintw(objects->treeWin, 7, 5, "type: %d", db->type);
-		mvwprintw(objects->treeWin, 8, 5, "shootCooldown: % 3d", db->shootCooldown);
-		mvwprintw(objects->treeWin, 9, 5, "globalTime: %llu", myCounters->globalTime);
-		mvwprintw(objects->treeWin, 10, 5, "seed: %u", conf->seed);
-	}
-	update_panels();
-	doupdate();
-
-	float remaining = conf->timeStep;
-	while (remaining > 0) {
-		float sleepTime = (remaining > 0.2f) ? 0.2f : remaining;
-
-		if (conf->messageTimeout > 0 && conf->message != NULL && objects->messagePanel != NULL) {
-			if (time(NULL) - conf->messageStartTime >= conf->messageTimeout) {
-				clearMessage(objects);
-				conf->message = NULL;
-			}
-		}
-
-		struct timespec ts;
-		ts.tv_sec = (time_t)(sleepTime);
-		ts.tv_nsec = (long)((sleepTime - ts.tv_sec) * 1000000000);
-		nanosleep(&ts, NULL);
-
-		int key = checkKeyPress(conf, myCounters);
-		if (key == 1) return 1;
-		if (key == 2) {
-			handleResize(conf, objects, trunk_x, trunk_y, baseHeight, off_x, off_y);
-			blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, *off_x, *off_y);
-			update_panels();
-			doupdate();
-		}
-
-		remaining -= sleepTime;
-	}
-	return 0;
-}
-
-// Hold the finished tree on screen until a real keypress; terminal
-// resizes just re-center and redraw it. RNG-free: shared by all engines.
-void finalHold(struct config *conf, struct ncursesObjects *objects,
-			   struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
-			   struct BranchList *branchList,
-			   int trunk_x, int trunk_y, int baseHeight, int *off_x, int *off_y) {
-	if (conf->no_disp || conf->infinite) return;
-
-	nodelay(stdscr, FALSE);
-	while (wgetch(stdscr) == KEY_RESIZE) {
-		handleResize(conf, objects, trunk_x, trunk_y, baseHeight, off_x, off_y);
-		blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, *off_x, *off_y);
-		update_panels();
-		doupdate();
-	}
-	nodelay(stdscr, TRUE);
-}
-
-// v1 engine: frozen. Consumes the global rand() stream seeded by srand();
-// any change to its rand() call sequence breaks replay of saved v1 trees.
-void growTree_v1(struct config *conf, struct ncursesObjects *objects, struct counters *myCounters) {
-	int maxY, maxX;
-	getmaxyx(objects->treeWin, maxY, maxX);
-
-	int baseHeight = getBaseHeight(conf->baseType);
-	struct VirtualGrid *skeleton = grid_create(maxX, maxY + baseHeight, 0, 0);
-	struct VirtualGrid *trunkPlane = grid_create(maxX, maxY + baseHeight, 0, 0);
-	struct VirtualGrid *renderPlane = NULL;  // v1: never render the widened trunk (frozen look)
-	int trunk_x = maxX / 2;
-	int trunk_y = maxY - 1 - baseHeight;
-	int off_x = 0, off_y = 0;
-	int rimLo = trunk_x, rimHi = trunk_x;
-
-	drawBaseToGrid(skeleton, conf->baseType, trunk_x, trunk_y);
-	drawPotRim(skeleton, conf->baseType, trunk_x, trunk_y, rimLo, rimHi);
-
-	struct BranchList branchList;
-	initBranchList(&branchList);
-
-	myCounters->trunks = 0;
-	myCounters->shoots = 0;
-	myCounters->branches = 0;
-	myCounters->shootCounter = 5;
-	myCounters->globalTime = 0;
-	myCounters->trunkSplitCooldown = 0;
-
-	struct Branch initialBranch = {
-		.x = trunk_x,
-		.y = trunk_y,
-		.life = conf->lifeStart,
-		.age = 0,
-		.type = trunk,
-		.shootCooldown = conf->multiplier,
-		.dripLeafCooldown = conf->multiplier + conf->lifeStart / 4,
-		.totalLife = conf->lifeStart,
-		.multiplier = conf->multiplier
-	};
-	addBranch(&branchList, initialBranch, myCounters);
-
-	int turn = 0;
-	while (branchList.count > 0) {
-		myCounters->globalTime++;
-
-		if (branchList.branches[turn].life <= 0) {
-			struct Branch* b = &branchList.branches[turn];
-			if (conf->proceduralMode &&
-				b->type != dying && b->type != dead &&
-				b->totalLife > 0) {
-				double lifeRatio = ((double)b->age) / b->totalLife;
-				unsigned int leaf_seed = b->leaf_seed;
-
-				int avg_x, avg_y;
-				get_average_position(b, &avg_x, &avg_y);
-
-				int log_factor = 0, dummy = b->age;
-				while(dummy > 0) {
-					log_factor++;
-					dummy >>= 1;
-				}
-
-				int leafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
-				enum branchType newType = (b->type == trunk) ? dead : dying;
-
-				generateLeaves_v1(conf, skeleton, newType, avg_x, avg_y, leafLife, leaf_seed, trunk_y + 1);
-			}
-
-			free(b->walkers);
-			b->walkers = NULL;
-			b->walker_count = 0;
-			b->walker_capacity = 0;
-			grid_destroy(b->leafGrid);
-			b->leafGrid = NULL;
-
-			removeBranch(&branchList, turn);
-			if (turn >= branchList.count) {
-				turn = 0;
-			}
-			continue;
-		}
-
-		updateBranch_v1(conf, skeleton, myCounters, turn, &branchList);
-
-		// record trunk cells in the trunk plane (tracking only, never
-		// blitted) and keep the pot rim hugging the trunk's footprint
-		{
-			struct Branch *ub = &branchList.branches[turn];
-			if (ub->type == trunk) {
-				grid_put(trunkPlane, ub->x, ub->y, "#", 0, 0);
-				if (ub->y == trunk_y && (ub->x < rimLo || ub->x > rimHi)) {
-					if (ub->x < rimLo) rimLo = ub->x;
-					if (ub->x > rimHi) rimHi = ub->x;
-					drawPotRim(skeleton, conf->baseType, trunk_x, trunk_y, rimLo, rimHi);
-				}
-			}
-		}
-
-		if (conf->live && conf->proceduralMode) {
-			for (int i = 0; i < branchList.count; i++) {
-				struct Branch* b = &branchList.branches[i];
-
-				if (b->type != trunk && b->type != shootLeft && b->type != shootRight)
-					continue;
-				if (b->totalLife <= 0)
-					continue;
-
-				int avg_x, avg_y;
-				get_average_position(b, &avg_x, &avg_y);
-
-				int log_factor = 0, dummy = b->age;
-				while(dummy > 0) {
-					log_factor++;
-					dummy >>= 1;
-				}
-
-				double lifeRatio = ((double)b->age) / b->totalLife;
-				int targetLeafLife = log_factor + lifeRatio * ((b->type == trunk) ? 4 : 3);
-
-				if (!b->walkers) {
-					b->walker_capacity = 16;
-					b->walker_count = 1;
-					b->walkers = malloc(sizeof(struct LeafWalker) * (size_t)b->walker_capacity);
-					b->walkers[0] = (struct LeafWalker){.x = avg_x, .y = avg_y, .seed = b->leaf_seed};
-					b->leaf_steps_drawn = 0;
-					b->leaf_cur_x = avg_x;
-					b->leaf_cur_y = avg_y;
-					b->leafGrid = grid_create(40, 40, avg_x - 20, avg_y - 20);
-				}
-
-				if (avg_x != b->leaf_cur_x || avg_y != b->leaf_cur_y) {
-					int delta_x = avg_x - b->leaf_cur_x;
-					int delta_y = avg_y - b->leaf_cur_y;
-					for (int w = 0; w < b->walker_count; w++) {
-						b->walkers[w].x += delta_x;
-						b->walkers[w].y += delta_y;
-					}
-					b->leafGrid->anchor_x += delta_x;
-					b->leafGrid->anchor_y += delta_y;
-					b->leaf_cur_x = avg_x;
-					b->leaf_cur_y = avg_y;
-				}
-
-				if (b->leaf_steps_drawn < targetLeafLife) {
-					enum branchType leafType = (b->type == trunk) ? dead : dying;
-					leafStepWalkers(conf, b->leafGrid, leafType, trunk_y + 1,
-									&b->walkers, &b->walker_count, &b->walker_capacity);
-					b->leaf_steps_drawn++;
-				}
-			}
-		}
-
-		turn = (turn + 1) % branchList.count;
-
-		if (conf->live && !(conf->load && myCounters->globalTime < conf->targetGlobalTime)) {
-			if (liveStepDisplay(conf, objects, skeleton, renderPlane, &branchList, myCounters,
-								trunk_x, trunk_y, baseHeight, &off_x, &off_y,
-								maxX, maxY, turn)) {
-				freeBranchList(&branchList);
-				grid_destroy(skeleton);
-				grid_destroy(trunkPlane);
-				quit(conf, objects, 0);
-			}
-		}
-	}
-
-	if (!conf->no_disp) {
-		blitTree(skeleton, renderPlane, trunk_y, &branchList, objects, off_x, off_y);
-		update_panels();
-		doupdate();
-	}
-
-	finalHold(conf, objects, skeleton, renderPlane, &branchList, trunk_x, trunk_y, baseHeight, &off_x, &off_y);
-
-	freeBranchList(&branchList);
-
-	grid_destroy(skeleton);
-	grid_destroy(trunkPlane);
 }
 
 // v2 engine: structurally a faithful port of v1, but fully self-seeded
@@ -3010,6 +3155,16 @@ void growTree_v2(struct config *conf, struct ncursesObjects *objects, struct cou
 	grid_destroy(trunkPlane);
 }
 
+
+// ==========================================================================
+// DISPATCH + ENTRY POINT
+// ==========================================================================
+
+// long-only option codes (no short form)
+#define OPT_ENGINE 1000
+
+#define OPT_BARE 1001
+
 struct TreeEngine get_engine(int version) {
 	struct TreeEngine engine;
 	switch (version) {
@@ -3105,10 +3260,6 @@ char* createDefaultCachePath(void) {
 	strcpy(result, toAppend);
 	return result;
 }
-
-// long-only option codes (no short form)
-#define OPT_ENGINE 1000
-#define OPT_BARE 1001
 
 int main(int argc, char* argv[]) {
 	setlocale(LC_ALL, "");
@@ -3231,13 +3382,14 @@ int main(int argc, char* argv[]) {
 			conf.message = optarg;
 			break;
 		case 'b':
-						/* 0 can legitimately be returned, so we cannot check wether
-						   strtold(optarg, NULL) != 0.  We need to set errno to zero
-						   before the conversion attempt, and check it it changed
-						   afterwards. */
-						errno = 0;
-						strtold(optarg, NULL);
-						if (!errno) conf.baseType = strtod(optarg, NULL);
+			/* 0 can legitimately be returned, so we cannot check whether
+			   strtold(optarg, NULL) != 0.  We need to set errno to zero
+			   before the conversion attempt, and check if it changed
+			   afterwards. */
+			errno = 0;
+			strtold(optarg, NULL);
+			if (!errno)
+				conf.baseType = strtod(optarg, NULL);
 			else {
 				printf("error: invalid base index: '%s'\n", optarg);
 				quit(&conf, &objects, 1);
