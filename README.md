@@ -90,12 +90,12 @@ Options:
   -c, --leaf=LIST        list of comma-delimited strings randomly chosen
                            for leaves
   -M, --multiplier=INT   branch multiplier; higher -> more
-                           branching (0-20) [default: 8]
+                           branching (1-20) [default: 7]
   -N, --name=TIME        create a named tree that grows over real time,
                            where TIME is life of tree in seconds.
                            MUST be used with -W to specify a save file.
                            (automatically enables -l and -P)
-  -L, --life=INT         life; higher -> more growth (0-200) [default: 120]
+  -L, --life=INT         life; higher -> more growth (10-500) [default: 80]
   -p, --print            print tree to terminal when finished
   -s, --seed=INT         seed random number generator
       --engine=INT       tree generation engine version for new trees

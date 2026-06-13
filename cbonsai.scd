@@ -45,13 +45,13 @@ cbonsai is an advanced bonsai tree generator with seasonal color changes, proced
 	list of comma-delimited strings randomly chosen for leaves
 
 *-M*, *--multiplier*=_INT_
-	branch multiplier; higher -> more branching (0-20) [default: 8]
+	branch multiplier; higher -> more branching (1-20) [default: 7]
 
 *-N*, *--name*=_TIME_
 	create a named tree that grows over real time, where TIME is life of tree in seconds. MUST be used with -W to specify a save file. (automatically enables -l and -P)
 
 *-L*, *--life*=_INT_
-	life; higher -> more growth (0-200) [default: 120]
+	life; higher -> more growth (10-500) [default: 80]
 
 *-p*, *--print*
 	print tree to terminal when finished
@@ -61,6 +61,9 @@ cbonsai is an advanced bonsai tree generator with seasonal color changes, proced
 
 *--engine*=_INT_
 	tree generation engine version for new trees (1 or 2) [default: 2]. Trees loaded with -C always use the engine version recorded in their save file, so previously saved trees keep their original look.
+
+*--bare*
+	suppress foliage and draw only the woody structure (trunk and branches). v2 engine only; the tree is identical, just with its leaves hidden. Useful for inspecting trunk shape.
 
 *-W*, *--save*=_FILE_
 	save progress to file [default: ~/.cache/cbonsai]
