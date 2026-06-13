@@ -58,6 +58,10 @@
 // Higher multiplier -> longer one-sided runs (bolder clusters).
 #define SHOOT_RUN_MDIV 6
 
+// v2: ticks after a trunk split during which no new shoots sprout, so a fork
+// gets a clean stretch before branching resumes
+#define SPLIT_SHOOT_GRACE 6
+
 // v2 trunk widening: thicken the centerline into a tapering body, widest at the
 // base. The per-cell taper uses distance ABOVE the base (which never moves), so
 // the shape is stable. Overall thickness is gated and grows with the tree:
@@ -65,10 +69,16 @@
 // slim), then the base half-width ramps up one step per TRUNK_GROW_DIV rows of
 // extra height, capped at TRUNK_MAX_HALF — so the trunk fattens as it matures.
 // The taper then drops the half-width by one every TRUNK_TAPER_DIV rows up.
-#define TRUNK_MAX_HALF    2
+#define TRUNK_MAX_HALF    3
 #define TRUNK_TAPER_DIV   6
 #define TRUNK_MIN_HEIGHT  14
 #define TRUNK_GROW_DIV    12
+
+// v2: a trunk pays this much life per row it climbs (instead of per tick), so
+// its total height is ~ L / TRUNK_RISE_COST regardless of the multiplier — a
+// high-M trunk just spends more time wandering sideways between rises. Raise
+// it for shorter trees, lower for taller.
+#define TRUNK_RISE_COST   4
 
 enum branchType {trunk, shootLeft, shootRight, dying, dead};
 
@@ -408,7 +418,7 @@ void printHelp(void) {
 			"█,█,█,▒,▒]\n"
 #endif
 			"  -M, --multiplier=INT   branch multiplier; higher -> more\n"
-			"                           branching (1-20) [default: 7]\n"
+			"                           branching (1-20) [default: 10]\n"
 			"  -N, --name=TIME        create a named tree that grows over real\n"
 			"                           time, where TIME is the full lifespan\n"
 			"                           of the tree in seconds. MUST be used\n"
@@ -416,7 +426,7 @@ void printHelp(void) {
 			"                           Automatically enables -l and -P.\n"
 			"                           Use -C to load and continue growing\n"
 			"                           a previously saved named tree.\n"
-			"  -L, --life=INT         life; higher -> more growth (10-500) [default: 80]\n"
+			"  -L, --life=INT         life; higher -> more growth (10-500) [default: 60]\n"
 			"  -p, --print            print tree to terminal when finished\n"
 			"  -s, --seed=INT         seed random number generator\n"
 			"      --engine=INT       tree generation engine version for\n"
@@ -749,6 +759,7 @@ struct Branch {
 	int multiplier;             // Stored multiplier
 	int lean;                   // v2: signed horizontal growth bias (committed side)
 	int splitDepth;             // v2: how many trunk splits deep this branch is
+	int shootGrace;             // v2: ticks after a split before this trunk shoots again
 	int deadwood;               // v2: jin/shari — currently bare bleached dead wood
 	int diebackLife;            // v2: life at/below which a destined fork dies back (0 = never)
 	unsigned int leaf_seed;		// for proceedural consistency (v1)
@@ -1020,7 +1031,7 @@ void setDeltas_v2(enum branchType type, int life, int totalLife, int age,
 		}
 		// young trunk should grow wide]
 		else if (isYoungTrunk(age, totalLife)) {
-			// every (multiplier * 0.6) steps, raise tree to next level
+			// every (multiplier * 0.4) steps, raise tree to next level
 			int step = (int)(multiplier * 0.6);
 			if (step < 1) step = 1;
 			if (age % step == 0) dy = -1;
@@ -1050,7 +1061,7 @@ void setDeltas_v2(enum branchType type, int life, int totalLife, int age,
 		// old-aged trunk
 		else {
 			dice = mrand(growth, 10);
-			if (dice > 4) dy = -1;
+			if (dice > 3) dy = -1;
 			else dy = 0;
 
 			dice = mrand(growth, 20);
@@ -1510,7 +1521,10 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 				struct msaw *growth, struct msaw *cosmetic, struct msaw *deadRng) {
 
 	struct Branch *branch = &list->branches[branchIdx];
-	branch->life--;     // decrement remaining life counter
+	// non-trunk branches age one life per tick; a trunk instead pays life per
+	// row it climbs (charged after setDeltas) so its height tracks L, not M
+	if (branch->type != trunk)
+		branch->life--;
 
 	// Random die-off check - more likely on shoots
 	if (branch->type == trunk) {
@@ -1528,7 +1542,7 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 	// jin/shari: a fork destined for deadwood grows alive and leafy, then dies
 	// back — once its life falls to diebackLife it becomes bare bleached wood
 	// for the rest of its (now short) life. Life-based so it triggers reliably
-	// (trunk life drains ~2/tick, faster than age climbs).
+	// as the trunk spends its height budget.
 	if (branch->diebackLife > 0 && !branch->deadwood && branch->life <= branch->diebackLife)
 		branch->deadwood = 1;
 
@@ -1539,6 +1553,14 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 	int groundY = skeleton->anchor_y + skeleton->height - getBaseHeight(conf->baseType);
 	if (branch->dy > 0 && branch->y > (groundY - 6))
 		branch->dy--;
+
+	// trunk life is a height budget: pay per climbed row so total height is
+	// ~ L / TRUNK_RISE_COST whether it rises often (low M) or rarely (high M).
+	// A stalled low-life tip still drains 1/tick so it can't hang forever.
+	if (branch->type == trunk) {
+		if (branch->dy < 0) branch->life -= TRUNK_RISE_COST;
+		else if (branch->life < 4) branch->life--;
+	}
 
 	// near-dead branch should branch into a lot of leaves; dead branches
 	// don't re-trigger this (would cascade exponentially), dying ones only
@@ -1635,7 +1657,7 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 		branch = &list->branches[branchIdx];
 	}
 	else if (branch->type == trunk) {
-		branch->life--;
+		// (trunk life is now charged per climbed row above, not per tick)
 		// First check for trunk splits - only in early phase and with enough life
 		if (!isYoungTrunk(branch->age, branch->totalLife)) {
 			int splitThreshold = (24 - branch->multiplier) + (2 * myCounters->trunks);
@@ -1659,6 +1681,7 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 				myCounters->trunkSplitCooldown = 2 + ((22 - conf->multiplier)*3)/4 +
 					(int)(5 * ((double)branch->totalLife - branch->age)/branch->totalLife);
 				myCounters->trunks++;
+				branch->shootGrace = SPLIT_SHOOT_GRACE;  // parent gets a clean stretch after the split
 				branch->shootCooldown = (25 - branch->multiplier)/4;
 				// sequence the two draws explicitly (v1 left this order
 				// unspecified inside the initializer list)
@@ -1693,6 +1716,7 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 					.multiplier = branch->multiplier,
 					.lean = childLean,
 					.splitDepth = branch->splitDepth + 1,
+					.shootGrace = SPLIT_SHOOT_GRACE,   // child also starts with a clean stretch
 					.diebackLife = childDieback,
 					.shootCooldown = conf->multiplier,
 					.dripLeafCooldown = branch->life / 4,
@@ -1705,13 +1729,18 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 				addBranch(list, newBranch, myCounters);
 				branch = &list->branches[branchIdx];
 				branch->lean = parentLean;
-				branch->life -= mrand(growth, 1) + (int)(5 * ((double)branch->totalLife - branch->age)/branch->totalLife); // cost of splitting
+				// cost of splitting — smaller at higher multiplier, since high M
+				// splits far more often (keeps total split drain ~M-independent)
+				int splitCoef = (32 - conf->multiplier) / 5;   // M7->5, M14->3, M20->2
+				if (splitCoef < 1) splitCoef = 1;
+				branch->life -= mrand(growth, 1) + (int)(splitCoef * ((double)branch->totalLife - branch->age)/branch->totalLife);
 			}
 		}
 
 		// Then check for regular branch shoots (deadwood limbs stay bare)
 		int branchDice = getBranchRollThreshold(branch->age, branch->totalLife, branch->multiplier);
-		if (branch->shootCooldown <= 0 && !branch->deadwood && mrand(growth, branchDice) == 0
+		if (branch->shootCooldown <= 0 && !branch->deadwood && branch->shootGrace <= 0
+			&& mrand(growth, branchDice) == 0
 			&& !structuralCrowded(list, branch->x, branch->y, branchIdx, SHOOT_MIN_DIST)) {
 			branch->shootCooldown = myCounters->trunks + (25 - branch->multiplier)/6;
 			int shootLife = ((branch->life * 3)/4 + mrand(growth, branch->multiplier) - 2);
@@ -1757,6 +1786,7 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 		}
 	}
 	myCounters->trunkSplitCooldown--;
+	branch->shootGrace--;
 	branch->shootCooldown--;
 	branch->dripLeafCooldown--;
 
@@ -2383,7 +2413,37 @@ static void drawWidenedTrunk(struct VirtualGrid *tp, WINDOW *win,
 			int cy = tp->anchor_y + gy;
 
 			int half = cell->widenHalf;
-			if (half < 1) continue;   // upper trunk / not yet widened: centerline only
+
+			// look at the connected centerline in the rows above/below (nearest
+			// occupied cell within reach) so the body can follow the trunk's bends
+			int aboveOff = 99, belowOff = 99, aboveHalf = 0;
+			if (gy > 0) {
+				struct GridCell *up = &tp->cells[(gy - 1) * tp->width];
+				for (int o = -2; o <= 2; o++) {
+					int nx = gx + o;
+					if (nx >= 0 && nx < tp->width && up[nx].occupied && abs(o) < abs(aboveOff)) {
+						aboveOff = o; aboveHalf = up[nx].widenHalf;
+					}
+				}
+			}
+			if (gy + 1 < tp->height) {
+				struct GridCell *dn = &tp->cells[(gy + 1) * tp->width];
+				for (int o = -2; o <= 2; o++) {
+					int nx = gx + o;
+					if (nx >= 0 && nx < tp->width && dn[nx].occupied && abs(o) < abs(belowOff))
+						belowOff = o;
+				}
+			}
+
+			// bottom-most layer (nothing below): grow out to match the trunk
+			// just above it instead of being width-limited, so the base doesn't
+			// pinch in. It stays symmetric (the bias below is skipped for it),
+			// so it ends up ~1 wider than the biased row above — the natural
+			// off-by-one flare.
+			int isBase = (belowOff == 99);
+			if (isBase && aboveHalf > half) half = aboveHalf;
+
+			if (half < 1) continue;   // not yet widened: centerline only
 
 			const char *g = cell->ch;
 			int len = (int)strlen(g);
@@ -2393,10 +2453,16 @@ static void drawWidenedTrunk(struct VirtualGrid *tp, WINDOW *win,
 
 			int lh = half, rh = half;
 
-			// lean-asymmetric bulge: thin the inside (concave) flank so the
-			// mass favours the outside of the curve (glyph encodes the lean)
-			if (g[len - 1] == '/' && lh > 0) lh--;        // right lean -> thin left
-			else if (g[0] == '\\' && rh > 0) rh--;        // left lean  -> thin right
+			// bias toward the side(s) where the trunk continues above/below,
+			// so the body follows the centerline's bends rather than growing
+			// straight out (thin the side with no trunk neighbour). Skipped for
+			// the base, which stays symmetric and full.
+			if (!isBase) {
+				int wantRight = (aboveOff != 99 && aboveOff > 0) || (belowOff != 99 && belowOff > 0);
+				int wantLeft  = (aboveOff != 99 && aboveOff < 0) || (belowOff != 99 && belowOff < 0);
+				if (wantRight && !wantLeft && lh > 0) lh--;
+				else if (wantLeft && !wantRight && rh > 0) rh--;
+			}
 
 			// anti-weld: a flank only fills empty cells and stops short of a
 			// neighbouring arm's centerline, splitting the gap so two arms
@@ -3038,8 +3104,8 @@ int main(int argc, char* argv[]) {
 		.screensaver = 0,
 		.printTree = 0,
 		.verbosity = 0,
-		.lifeStart = 80,
-		.multiplier = 7,
+		.lifeStart = 60,
+		.multiplier = 10,
 		.baseType = 1,
 		.seed = 0,
 		.leavesSize = 0,
