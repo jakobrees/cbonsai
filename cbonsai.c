@@ -30,7 +30,7 @@
 // diverges where a dead fork actually appears.
 #define MSAW_DEADWOOD_SALT 0xBF58476D1CE4E5B9ULL
 // 1-in-N chance that a trunk split spawns a bare deadwood fork
-#define DEADWOOD_CHANCE 7
+#define DEADWOOD_CHANCE 8
 
 // v2 canopy pads: leaf walkers carry an outward sign and lean their drift away
 // from the trunk so foliage pools into clouds instead of a symmetric mush.
@@ -57,6 +57,14 @@
 // foliage groups into alternating pads instead of a strict left/right comb.
 // Higher multiplier -> longer one-sided runs (bolder clusters).
 #define SHOOT_RUN_MDIV 6
+
+// v2: ceiling on shoot life, hence how far a shoot can run sideways. Shoot life
+// is derived from the trunk's remaining life, but a trunk's life is a HEIGHT
+// budget (see TRUNK_RISE_COST), so off a fresh high-life base the raw value is
+// huge and the shoot crawls clear across the screen. Cap it to the trunk's
+// height budget (totalLife / this) plus a little multiplier slack, so a shoot
+// never reaches much farther than the tree is tall. Lower -> shorter shoots.
+#define SHOOT_LIFE_CAP_DIV 3
 
 // v2: ticks after a trunk split during which no new shoots sprout, so a fork
 // gets a clean stretch before branching resumes
@@ -673,9 +681,9 @@ struct ColorResult chooseColorResult(enum branchType type) {
 	int r;
 	switch(type) {
 	case trunk:
-		r = rand() % 4;
-		if (r < 2) { cr.attrs = A_BOLD; cr.color_pair = 20; }
-		else if (r == 2) { cr.color_pair = 20; }
+		r = rand() % 6;
+		if (r < 3) { cr.attrs = A_BOLD; cr.color_pair = 20; }
+		else if (r < 5) { cr.color_pair = 20; }
 		else { cr.color_pair = 21; }
 		break;
 
@@ -1744,6 +1752,13 @@ void updateBranch_v2(struct config *conf, struct VirtualGrid *skeleton,
 			&& !structuralCrowded(list, branch->x, branch->y, branchIdx, SHOOT_MIN_DIST)) {
 			branch->shootCooldown = myCounters->trunks + (25 - branch->multiplier)/6;
 			int shootLife = ((branch->life * 3)/4 + mrand(growth, branch->multiplier) - 2);
+			// ceiling: shoot life (and thus sideways reach) tracks the trunk's
+			// height budget, so a shoot off a fresh high-life base can't run
+			// clear across the screen. Applied before the floor so the floor
+			// always wins as the lower bound on tiny trees.
+			int shootCap = branch->totalLife / SHOOT_LIFE_CAP_DIV + branch->multiplier/3;
+			if (shootLife > shootCap)
+				shootLife = shootCap;
 			// floor keeps shoots near the top of the trunk acting like
 			// branches for a few steps before their dying phase, instead
 			// of being born straight into it
