@@ -76,16 +76,31 @@ gcc -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-qual -pedantic \
 ### Debian / Ubuntu
 
 ```bash
-sudo apt install libncursesw5-dev
+sudo apt install build-essential libncurses-dev pkg-config
 git clone https://github.com/jakobrees/cbonsai.git
 cd cbonsai
 make install PREFIX=~/.local
 ```
 
+### Arch
+
+```bash
+sudo pacman -S --needed base-devel ncurses
+git clone https://github.com/jakobrees/cbonsai.git
+cd cbonsai
+make install PREFIX=~/.local
+```
+
+### Nix / NixOS
+
+```bash
+nix run github:jakobrees/cbonsai
+```
+
 ### Fedora
 
 ```bash
-sudo dnf install ncurses-devel
+sudo dnf install gcc make ncurses-devel pkgconf-pkg-config
 git clone https://github.com/jakobrees/cbonsai.git
 cd cbonsai
 make install PREFIX=~/.local
@@ -130,6 +145,7 @@ Options:
   -W, --save=FILE        save progress to file [default: ~/.cache/cbonsai]
   -C, --load=FILE        load progress from file [default: ~/.cache/cbonsai]
   -v, --verbose          increase output verbosity
+      --version          show version
   -h, --help             show help
 ```
 
@@ -191,6 +207,10 @@ The growth algorithm is **versioned**. New trees use the latest engine (v2);
 trees loaded from a save file replay under whatever engine they were created
 with, so algorithm updates never change the look of an existing tree. Pass
 `--engine` to choose the engine for new trees.
+
+## Contributing
+
+Found a bug, or have a fix? Open an issue; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Credits
 

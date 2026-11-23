@@ -1,0 +1,25 @@
+# Maintainer: Jakob Rees
+# Run `updpkgsums && makepkg --printsrcinfo > .SRCINFO` after tagging.
+pkgname=cbonsai-jakobrees
+pkgver=2.0.0
+pkgrel=1
+pkgdesc="Grow bonsai trees in your terminal, with seasonal color and real-time growth"
+arch=('x86_64' 'aarch64')
+url="https://github.com/jakobrees/cbonsai"
+license=('GPL-3.0-only')
+depends=('ncurses')
+makedepends=('scdoc')
+provides=('cbonsai')
+conflicts=('cbonsai')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('REPLACE_AFTER_TAGGING')
+
+build() {
+  cd "cbonsai-$pkgver"
+  make
+}
+
+package() {
+  cd "cbonsai-$pkgver"
+  make DESTDIR="$pkgdir" PREFIX=/usr install
+}

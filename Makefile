@@ -13,34 +13,29 @@ WITH_BASH ?= 1
 
 # OS detection
 OS := $(shell uname -s)
-BREW_PREFIX := $(shell command -v brew >/dev/null 2>&1 && brew --prefix || echo '')
 
 # Default flags
 CFLAGS   += -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-qual -pedantic
 LDFLAGS  +=
 LDLIBS   +=
 
-# OS-specific configurations
-ifeq ($(OS),Darwin)
-    ifdef BREW_PREFIX
-        PKG_CONFIG_PATH += :$(BREW_PREFIX)/opt/ncurses/lib/pkgconfig
-        CPPFLAGS += -I$(BREW_PREFIX)/opt/ncurses/include
-        LDFLAGS  += -L$(BREW_PREFIX)/opt/ncurses/lib
+# Find ncurses: pkg-config first (Linux, Nix, MacPorts, Homebrew formulae),
+# then Homebrew's keg-only copy, then plain library names.
+ifeq ($(shell $(PKG_CONFIG) --exists ncursesw panelw 2>/dev/null && echo 1),1)
+    CPPFLAGS += $(shell $(PKG_CONFIG) --cflags ncursesw panelw)
+    LDLIBS   += $(shell $(PKG_CONFIG) --libs panelw ncursesw)
+else ifeq ($(OS),Darwin)
+    BREW_NCURSES := $(shell brew --prefix ncurses 2>/dev/null)
+    ifneq ($(BREW_NCURSES),)
+        CPPFLAGS += -I$(BREW_NCURSES)/include
         # Use the full paths to the static libraries
-        LDLIBS   += $(BREW_PREFIX)/opt/ncurses/lib/libncurses.a \
-                    $(BREW_PREFIX)/opt/ncurses/lib/libpanel.a
+        LDLIBS   += $(BREW_NCURSES)/lib/libpanel.a $(BREW_NCURSES)/lib/libncurses.a
     else
-        $(error Homebrew not found. Please install Homebrew and ncurses)
+        $(warning ncurses not found: install it, or pkg-config, via Homebrew, MacPorts or Nix)
+        LDLIBS   += -lpanel -lncurses
     endif
 else
-    # Linux and other systems
-    ifeq ($(shell $(PKG_CONFIG) --exists ncursesw panelw 2>/dev/null && echo 1),1)
-        CFLAGS  += $(shell $(PKG_CONFIG) --cflags ncursesw panelw)
-		CFLAGS  += $(shell $(PKG_CONFIG) -static)
-        LDLIBS  += $(shell $(PKG_CONFIG) --libs ncursesw panelw)
-    else
-        LDLIBS  += -lncursesw -ltinfo -lpanelw
-    endif
+    LDLIBS  += -lpanelw -lncursesw -ltinfo
 endif
 
 # Default target
@@ -74,10 +69,10 @@ deps:
 ifeq ($(HAS_APT),1)
 	@echo "Installing dependencies using apt..."
 	@sudo apt-get update
-	@sudo apt-get install -y libncursesw5-dev libpanel-dev pkg-config
+	@sudo apt-get install -y libncurses-dev pkg-config
 else ifeq ($(HAS_YUM),1)
 	@echo "Installing dependencies using yum..."
-	@sudo yum install -y ncurses-devel ncurses-panel-devel pkg-config
+	@sudo yum install -y ncurses-devel pkgconf-pkg-config
 else ifeq ($(HAS_PACMAN),1)
 	@echo "Installing dependencies using pacman..."
 	@sudo pacman -S --needed ncurses pkg-config
