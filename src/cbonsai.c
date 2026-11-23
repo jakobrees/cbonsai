@@ -114,6 +114,21 @@
 // sapling doesn't rain leaves
 #define FALL_FULL_CANOPY    20
 
+// leaves fall up to this much faster while edge-on (vertical)
+#define FALL_EDGE_ON_BOOST  0.20
+
+// landing on the ground: over the last SETTLE_DOTS a leaf loses its swing,
+// levels out, and slows to SETTLE_SPEED dots/s
+#define FALL_SETTLE_DOTS    8.0
+
+#define FALL_SETTLE_SPEED   3.5
+
+// landing on the big pot's "_" grass: 1 = sink through it, drawn as an
+// underlined glyph so the "_" line stays; 0 = disappear on touching it
+#ifndef FALL_GRASS_SINK
+#define FALL_GRASS_SINK     1
+#endif
+
 // seconds between animation frames
 #define FALL_FRAME_TIME     (1.0 / 30.0)
 
@@ -154,6 +169,14 @@ enum branchType {trunk, shootLeft, shootRight, dying, dead};
 
 enum fallStyle {FALL_DOTS, FALL_LINES};
 
+enum leafMode {
+	LEAF_AIR,
+	LEAF_SETTLING,   // last stretch above the ground
+	LEAF_RESTING,    // lying on the ground
+	LEAF_SINKING,    // into the pot's grass
+	LEAF_TIPPING     // sliding off the edge of the pot
+};
+
 // One falling leaf. Positions are in dots, in tree (grid) coordinates, so
 // leaves stay put relative to the tree when the terminal is resized.
 struct FallingLeaf {
@@ -164,8 +187,11 @@ struct FallingLeaf {
 	double fall, slide;         // downward speed; sideways speed (tumblers)
 	double ease;                // 0..1: the motion builds up after letting go
 	double startSin, startCos;  // phase terms at release, so it starts in place
+	double vx, vy;              // current velocity
+	double edgeOn;              // 0..1: how vertical it currently is
 	double rest;                // seconds left lying on the ground
-	int resting;
+	enum leafMode mode;
+	int tipDir;                 // side of the pot it tips off: -1 left, 1 right
 	int tumbles;
 	int angle;                  // 0 flat, 1 rising '/', 2 edge-on '|', 3 falling '\\'
 	short color_pair;
@@ -180,6 +206,7 @@ struct FallState {
 	double clock;               // animated seconds so far
 	double lastTime;            // wall time of the last update (0 = none yet)
 	double debt;                // fractional leaves owed
+	int trunkX;                 // trunk column, in tree coordinates
 	int count;
 	struct FallingLeaf leaves[FALL_MAX_LEAVES];
 };
@@ -1582,14 +1609,14 @@ static void fallSpawn(struct FallState *f, const struct ncursesObjects *objects,
 	leaf->color_pair = perchPair;
 }
 
-// Advance one airborne leaf.
+// Advance one leaf through the air.
 //
 // Gliders swing like a pendulum: x follows sin(phase) and y gets a
 // cos(2*phase) term, so each swing is a shallow U. The leaf speeds up through
 // the bottom, then slows and hangs as it turns, and is drawn along its
 // direction of travel. Tumblers spin end over end, fall faster, and slide off
-// to one side.
-static void fallMove(struct FallingLeaf *leaf, double dt, double wind) {
+// to one side. Either kind falls a little faster while edge-on.
+static void fallFly(struct FallingLeaf *leaf, double dt, double wind) {
 	double oldX = leaf->x, oldY = leaf->y;
 
 	leaf->ease += dt / 1.2;
@@ -1600,23 +1627,92 @@ static void fallMove(struct FallingLeaf *leaf, double dt, double wind) {
 
 	if (leaf->tumbles) {
 		leaf->phase += leaf->omega * 2.6 * dt;
+		// 1 in the middle of the vertical quarter of the spin, 0 when flat
+		double c = cos(leaf->phase - FALL_PI * 5.0 / 8.0);
+		leaf->edgeOn = c * c;
 		leaf->pathX += leaf->slide * leaf->ease * dt;
-		leaf->pathY += fallStep * 1.35;
+		leaf->pathY += fallStep * 1.35 * (1.0 + FALL_EDGE_ON_BOOST * leaf->edgeOn);
 		leaf->x = leaf->pathX + 0.5 * sin(2.0 * leaf->phase);
 		leaf->y = leaf->pathY;
 		leaf->angle = ((int)floor(leaf->phase / (FALL_PI / 4.0)) % 4 + 4) % 4;
-		return;
+	} else {
+		double target = (leaf->angle == 2) ? 1.0 : 0.0;
+		leaf->edgeOn += (target - leaf->edgeOn) * (1.0 - exp(-dt / 0.12));
+		leaf->phase += leaf->omega * dt;
+		leaf->pathY += fallStep * (1.0 + FALL_EDGE_ON_BOOST * leaf->edgeOn);
+		leaf->x = leaf->pathX + leaf->ease * leaf->amp * (sin(leaf->phase) - leaf->startSin);
+		leaf->y = leaf->pathY + leaf->ease * leaf->lift * (cos(2.0 * leaf->phase) - leaf->startCos);
+
+		double dx = leaf->x - oldX, dy = leaf->y - oldY;
+		if (fabs(dy) < 0.6 * fabs(dx))      leaf->angle = 0;
+		else if (fabs(dy) > 3.0 * fabs(dx)) leaf->angle = 2;
+		else                                leaf->angle = (dx * dy < 0) ? 1 : 3;
 	}
 
-	leaf->phase += leaf->omega * dt;
-	leaf->pathY += fallStep;
-	leaf->x = leaf->pathX + leaf->ease * leaf->amp * (sin(leaf->phase) - leaf->startSin);
-	leaf->y = leaf->pathY + leaf->ease * leaf->lift * (cos(2.0 * leaf->phase) - leaf->startCos);
+	leaf->vx = (leaf->x - oldX) / dt;
+	leaf->vy = (leaf->y - oldY) / dt;
+}
 
-	double vx = leaf->x - oldX, vy = leaf->y - oldY;
-	if (fabs(vy) < 0.6 * fabs(vx))      leaf->angle = 0;
-	else if (fabs(vy) > 3.0 * fabs(vx)) leaf->angle = 2;
-	else                                leaf->angle = (vx * vy < 0) ? 1 : 3;
+// Advance one leaf. groundY and edgeY are the dot rows (tree coordinates) of
+// the ground and of the top of the pot.
+static void fallMove(struct FallingLeaf *leaf, double dt, double wind, double speed,
+					 double groundY, double edgeY) {
+	if (dt <= 0) return;
+
+	switch (leaf->mode) {
+	case LEAF_AIR:
+		fallFly(leaf, dt, wind);
+		break;
+
+	case LEAF_SETTLING: {
+		leaf->vx *= exp(-dt / 0.45);
+		leaf->vy += (FALL_SETTLE_SPEED * speed - leaf->vy) * (1.0 - exp(-dt / 0.25));
+		leaf->x += leaf->vx * dt;
+		leaf->y += leaf->vy * dt;
+
+		// level out one step at a time
+		double height = groundY - leaf->y;
+		if (height < 2.0) leaf->angle = 0;
+		else if (height < 5.0 && leaf->angle == 2) leaf->angle = (leaf->vx < 0) ? 1 : 3;
+		break;
+	}
+
+	case LEAF_RESTING:
+		// skid to a stop
+		leaf->vx *= exp(-dt / 0.25);
+		leaf->x += leaf->vx * dt;
+		leaf->rest -= dt;
+		break;
+
+	case LEAF_SINKING:
+		leaf->vx *= exp(-dt / 0.1);
+		if (leaf->vy < 7.0 * speed) leaf->vy = 7.0 * speed;
+		leaf->x += leaf->vx * dt;
+		leaf->y += leaf->vy * dt;
+		break;
+
+	case LEAF_TIPPING:
+		// slide outward along the top of the edge, tilting as it goes over
+		leaf->vx += leaf->tipDir * 25.0 * dt;
+		if (leaf->vx * leaf->tipDir > 8.0) leaf->vx = leaf->tipDir * 8.0;
+		leaf->x += leaf->vx * dt;
+		leaf->y = edgeY;
+		leaf->angle = (leaf->vx * leaf->tipDir < 3.0) ? 0 : (leaf->tipDir < 0) ? 1 : 3;
+		break;
+	}
+}
+
+// Let a leaf that has slid off the pot's edge tumble down past its side.
+static void fallOffEdge(struct FallState *f, struct FallingLeaf *leaf) {
+	leaf->mode = LEAF_AIR;
+	leaf->tumbles = 1;
+	leaf->slide = leaf->tipDir * fallUniform(f, 4.0, 6.0);
+	leaf->ease = 0.6;
+	// spin the way it tipped, starting from the diagonal it is already drawn at
+	leaf->omega = -leaf->tipDir * fabs(leaf->omega);
+	leaf->phase = (leaf->tipDir < 0) ? FALL_PI * 3.0 / 8.0 : FALL_PI * 7.0 / 8.0;
+	leaf->pathX = leaf->x - 0.5 * sin(2.0 * leaf->phase);
+	leaf->pathY = leaf->y;
 }
 
 // Advance the animation to the present. Call right after the tree has been
@@ -1646,7 +1742,11 @@ static void fallUpdate(struct config *conf, const struct ncursesObjects *objects
 
 	double t = f->clock;
 	double wind = FALL_BREEZE * (0.4 + 0.5 * sin(0.31 * t) + 0.35 * sin(0.83 * t + 1.3));
-	int rimRow = (getBaseHeight(conf->baseType) > 0) ? trunk_y + off_y + 1 : -1;
+
+	int havePot = getBaseHeight(conf->baseType) > 0;
+	int rimRow = trunk_y + off_y + 1;
+	double edgeY = (trunk_y + 1) * 4 - 1;          // last dot row above the rim
+	double groundY = (h - 1 - off_y) * 4 + 3;      // last dot row on screen
 
 	wchar_t wch[128];
 	attr_t attrs;
@@ -1656,35 +1756,62 @@ static void fallUpdate(struct config *conf, const struct ncursesObjects *objects
 	for (int i = 0; i < f->count; i++) {
 		struct FallingLeaf leaf = f->leaves[i];
 
-		if (leaf.resting) {
-			leaf.rest -= dt;
-			if (leaf.rest <= 0) continue;
-		} else {
-			fallMove(&leaf, dt, wind);
-			int wx = floorDiv((int)floor(leaf.x), 2) + off_x;
-			int wy = floorDiv((int)floor(leaf.y), 4) + off_y;
-			if (wx < -10 || wx > w + 10) continue;
+		double prevY = leaf.y;
+		fallMove(&leaf, dt, wind, f->speed, groundY, edgeY);
+		int wx = floorDiv((int)floor(leaf.x), 2) + off_x;
+		if (wx < -10 || wx > w + 10) continue;
 
-			int landRow = -1;
-			if (wy >= h - 1)
-				landRow = h - 1;
-			else if (rimRow > 0 && wy == rimRow - 1
-					 && readGlyph(objects, rimRow, wx, wch, &attrs, &pair))
-				landRow = wy;
+		switch (leaf.mode) {
+		case LEAF_AIR:
+			// coming down onto the pot?
+			if (havePot && prevY < edgeY && leaf.y >= edgeY
+				&& readGlyph(objects, rimRow, wx, wch, &attrs, &pair)) {
+				if (wch[0] == L':' || wch[0] == L'(' || wch[0] == L')') {
+					leaf.mode = LEAF_TIPPING;
+					leaf.tipDir = (wx < off_x + conf->fall->trunkX) ? -1 : 1;
+					leaf.y = edgeY;
+				} else if (FALL_GRASS_SINK && wch[0] == L'_') {
+					leaf.mode = LEAF_SINKING;
+				} else {
+					continue;
+				}
+			} else if (leaf.y >= groundY - FALL_SETTLE_DOTS) {
+				leaf.mode = LEAF_SETTLING;
+			}
+			break;
 
-			if (landRow >= 0) {
-				leaf.resting = 1;
+		case LEAF_SETTLING:
+			if (leaf.y >= groundY) {
+				leaf.mode = LEAF_RESTING;
 				leaf.rest = fallUniform(f, 3.0, 9.0);
 				leaf.angle = 0;
-				leaf.y = (landRow - off_y) * 4 + 3;
+				leaf.y = groundY;
 			}
+			break;
+
+		case LEAF_RESTING:
+			if (leaf.rest <= 0) continue;
+			break;
+
+		case LEAF_SINKING:
+			if (leaf.y >= edgeY + 4.5) continue;
+			break;
+
+		case LEAF_TIPPING:
+			if (!readGlyph(objects, rimRow, wx, wch, &attrs, &pair)) {
+				// clear of the pot (or pushed off by a resize)
+				fallOffEdge(f, &leaf);
+			}
+			break;
 		}
 		f->leaves[kept++] = leaf;
 	}
 	f->count = kept;
 }
 
-// Draw the leaves onto the tree window, only where the tree left it blank.
+// Draw the leaves onto the tree window, only where the tree left it blank. The
+// exception is a leaf sinking into the pot's grass: a terminal cell holds one
+// glyph, so its cell is drawn underlined to stand in for the "_" it replaces.
 static void fallDraw(const struct config *conf, const struct ncursesObjects *objects,
 					 int trunk_x, int trunk_y, int off_x, int off_y) {
 	// braille dot bits by [row][column] within a cell
@@ -1698,7 +1825,7 @@ static void fallDraw(const struct config *conf, const struct ncursesObjects *obj
 	const struct FallState *f = conf->fall;
 
 	// dots sharing a cell have to be merged into a single glyph
-	struct { int x, y, mask; short pair; } cells[FALL_MAX_LEAVES * 2];
+	struct { int x, y, mask, sinking; short pair; } cells[FALL_MAX_LEAVES * 2];
 	int cellCount = 0;
 
 	int h, w;
@@ -1713,7 +1840,7 @@ static void fallDraw(const struct config *conf, const struct ncursesObjects *obj
 		int px = (int)floor(leaf->x) + off_x * 2;
 		int py = (int)floor(leaf->y) + off_y * 4;
 		// a leaf on the ground turns gray before it disappears
-		short leafPair = (leaf->resting && leaf->rest < 1.5) ? 8 : leaf->color_pair;
+		short leafPair = (leaf->mode == LEAF_RESTING && leaf->rest < 1.5) ? 8 : leaf->color_pair;
 
 		int pieces = (f->style == FALL_LINES) ? 1 : 2;
 		for (int d = 0; d < pieces; d++) {
@@ -1733,16 +1860,24 @@ static void fallDraw(const struct config *conf, const struct ncursesObjects *obj
 				cells[c].x = wx;
 				cells[c].y = wy;
 				cells[c].mask = 0;
+				cells[c].sinking = 0;
 				cellCount++;
 			}
 			cells[c].mask = (f->style == FALL_LINES) ? bit : (cells[c].mask | bit);
 			cells[c].pair = leafPair;
+			if (leaf->mode == LEAF_SINKING) cells[c].sinking = 1;
 		}
 	}
 
 	for (int c = 0; c < cellCount; c++) {
 		int wx = cells[c].x, wy = cells[c].y;
-		if (readGlyph(objects, wy, wx, wch, &attrs, &pair)) continue;
+		attr_t leafAttrs = 0;
+		if (readGlyph(objects, wy, wx, wch, &attrs, &pair)) {
+			if (!cells[c].sinking || wch[0] != L'_' || wy != trunk_y + off_y + 1) continue;
+			// keep the grass's own look, so its line doesn't change color
+			leafAttrs = A_UNDERLINE | A_BOLD;
+			cells[c].pair = pair;
+		}
 		if (insidePot(conf->baseType, trunk_x, trunk_y, wx, wy, off_x, off_y)) continue;
 
 		char glyph[4] = {0};
@@ -1754,9 +1889,9 @@ static void fallDraw(const struct config *conf, const struct ncursesObjects *obj
 			glyph[1] = (char)(0xA0 | (cells[c].mask >> 6));
 			glyph[2] = (char)(0x80 | (cells[c].mask & 0x3F));
 		}
-		wattron(objects->treeWin, COLOR_PAIR(cells[c].pair));
+		wattron(objects->treeWin, leafAttrs | COLOR_PAIR(cells[c].pair));
 		mvwaddstr(objects->treeWin, wy, wx, glyph);
-		wattroff(objects->treeWin, COLOR_PAIR(cells[c].pair));
+		wattroff(objects->treeWin, leafAttrs | COLOR_PAIR(cells[c].pair));
 	}
 }
 
@@ -1767,6 +1902,7 @@ static void drawTreeFrame(struct config *conf, struct ncursesObjects *objects,
 						  int trunk_x, int trunk_y, int off_x, int off_y) {
 	blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, off_x, off_y);
 	if (conf->fall) {
+		conf->fall->trunkX = trunk_x;
 		fallUpdate(conf, objects, trunk_y, off_x, off_y);
 		fallDraw(conf, objects, trunk_x, trunk_y, off_x, off_y);
 	}
