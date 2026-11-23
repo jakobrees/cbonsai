@@ -14,6 +14,7 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <sys/time.h>
 
@@ -688,7 +689,7 @@ int loadFromFile(struct config *conf) {
 	int lifeStart, multiplier, baseType;
 	if (fscanf(fp, "%d %d %d", &lifeStart, &multiplier, &baseType) == 3) {
 		conf->lifeStart = lifeStart;
-		conf->multiplier = multiplier;
+		conf->multiplier = (multiplier != 0) ? multiplier : 1;	// 0 would divide by zero
 		conf->baseType = baseType;
 	}
 
@@ -1235,9 +1236,16 @@ int drawMessage(struct config *conf, struct ncursesObjects *objects, char* messa
 			mvwprintw(objects->treeWin, 10, 5, "linePosition: %02d", linePosition);
 		}
 
+		// a word too long for the buffer is printed in pieces
+		if (wordLength >= (int) sizeof(wordBuffer) - 1) {
+			wprintw(objects->messageWin, "%s", wordBuffer);
+			wordLength = 0;
+			wordBuffer[0] = '\0';
+		}
+
 		// append this character to word buffer,
 		// if it's not space or NULL and it can fit
-		if (!(isspace(thisChar) || thisChar == '\0') && wordLength < (int) (sizeof(wordBuffer) / sizeof(wordBuffer[0]))) {
+		if (!(isspace(thisChar) || thisChar == '\0') && wordLength < (int) sizeof(wordBuffer) - 1) {
 			strncat(wordBuffer, &thisChar, 1);
 			wordLength++;
 			linePosition++;
@@ -2004,6 +2012,8 @@ void finalHold(struct config *conf, struct ncursesObjects *objects,
 					conf->quitRequested = 1;
 					return;
 				}
+				// any other key moves on to the next tree, as without leaves
+				if (ch != ERR) return;
 				if (conf->fall->clock - start >= conf->timeWait) return;
 			} else if (ch != ERR) {
 				return;
@@ -4145,7 +4155,8 @@ int main(int argc, char* argv[]) {
 			conf.proceduralMode = 1;
 			break;
 		case 's':
-			if (strtold(optarg, NULL) != 0) conf.seed = strtod(optarg, NULL);
+			if (strtold(optarg, NULL) != 0 && fabsl(strtold(optarg, NULL)) <= INT_MAX)
+				conf.seed = strtod(optarg, NULL);
 			else {
 				printf("error: invalid seed: '%s'\n", optarg);
 				quit(&conf, &objects, 1);
@@ -4315,6 +4326,10 @@ int main(int argc, char* argv[]) {
 		token = strtok(NULL, ",");
 		conf.leavesSize++;
 	}
+	if (conf.leavesSize == 0) {
+		printf("error: no leaves given with -c\n");
+		quit(&conf, &objects, 1);
+	}
 
 	// no braille without a multibyte locale, nor usually on the Linux console
 	if (conf.fall && !fallStyleGiven) {
@@ -4365,7 +4380,8 @@ int main(int argc, char* argv[]) {
 		if (conf.infinite) {
 			// with falling leaves, finalHold() has already waited
 			if (!conf.fall) {
-				timeout(conf.timeWait * 1000);
+				// timeout() takes int milliseconds
+				timeout(conf.timeWait < INT_MAX / 1000 ? (int)(conf.timeWait * 1000) : INT_MAX);
 				int key = checkKeyPress(&conf, &myCounters);
 				if (key == 1)
 					quit(&conf, &objects, 0);
