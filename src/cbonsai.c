@@ -14,6 +14,8 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
+#include <math.h>
+#include <sys/time.h>
 
 #include "msaw.h"
 
@@ -90,6 +92,31 @@
 // it for shorter trees, lower for taller.
 #define TRUNK_RISE_COST   4
 
+// Falling leaves (--falling-leaves). Distances are in braille dots: 2 per
+// column, 4 per row, which is roughly square on screen. Defaults for the
+// --falling-rate (leaves/s) and --falling-speed (multiplier) options:
+#define FALL_RATE_DEFAULT   1.1
+
+#define FALL_SPEED_DEFAULT  1.0
+
+// downward speed at --falling-speed 1.0, in dots/s (each leaf picks its own)
+#define FALL_SPEED_MIN      5.6
+
+#define FALL_SPEED_MAX      9.0
+
+// strength of the slow, gusting sideways breeze, in dots/s
+#define FALL_BREEZE         2.5
+
+// 1-in-N leaves tumble end over end; the rest glide in shallow U-shaped swings
+#define FALL_TUMBLE_CHANCE  4
+
+// canopies with fewer exposed leaves than this shed proportionally less, so a
+// sapling doesn't rain leaves
+#define FALL_FULL_CANOPY    20
+
+// seconds between animation frames
+#define FALL_FRAME_TIME     (1.0 / 30.0)
+
 
 // ==========================================================================
 // INTERNAL CONSTANTS  (not aesthetic knobs — changing these alters output / determinism)
@@ -111,12 +138,51 @@
 // diverges where a dead fork actually appears.
 #define MSAW_DEADWOOD_SALT 0xBF58476D1CE4E5B9ULL
 
+// salt for the falling-leaves stream (presentation only, like widening)
+#define MSAW_FALL_SALT 0x94D049BB133111EBULL
+
+#define FALL_MAX_LEAVES 512
+
+#define FALL_PI 3.14159265358979323846
+
 
 // ==========================================================================
 // TYPES  (hoisted: every struct/enum precedes all functions)
 // ==========================================================================
 
 enum branchType {trunk, shootLeft, shootRight, dying, dead};
+
+enum fallStyle {FALL_DOTS, FALL_LINES};
+
+// One falling leaf. Positions are in dots, in tree (grid) coordinates, so
+// leaves stay put relative to the tree when the terminal is resized.
+struct FallingLeaf {
+	double pathX, pathY;        // the path it swings around
+	double x, y;                // where it is drawn
+	double phase, omega;        // swing / spin angle and rate (rad, rad/s)
+	double amp, lift;           // swing width, and height of the U
+	double fall, slide;         // downward speed; sideways speed (tumblers)
+	double ease;                // 0..1: the motion builds up after letting go
+	double startSin, startCos;  // phase terms at release, so it starts in place
+	double rest;                // seconds left lying on the ground
+	int resting;
+	int tumbles;
+	int angle;                  // 0 flat, 1 rising '/', 2 edge-on '|', 3 falling '\\'
+	short color_pair;
+};
+
+struct FallState {
+	enum fallStyle style;
+	double rate;                // leaves per second
+	double speed;               // downward speed multiplier
+	unsigned int seasons;       // bit per enum Season in which leaves fall
+	struct msaw rng;
+	double clock;               // animated seconds so far
+	double lastTime;            // wall time of the last update (0 = none yet)
+	double debt;                // fractional leaves owed
+	int count;
+	struct FallingLeaf leaves[FALL_MAX_LEAVES];
+};
 
 struct config {
 	unsigned long long targetGlobalTime;
@@ -152,6 +218,8 @@ struct config {
 	int no_disp;
 	int hideLeaves;          // --bare: suppress foliage rendering (v2 only)
 	int season;              // --season: forced season (enum Season), or -1 for auto-by-date
+	struct FallState *fall;  // --falling-leaves state, or NULL when off
+	int quitRequested;       // user quit while the finished tree was on display
 };
 
 struct ncursesObjects {
@@ -315,6 +383,7 @@ void updateScreen(float timeStep);
 static inline int interpolate_color(int color1, int color2, float ratio);
 enum Season get_current_season_with_blend(float *blend_ratio);
 int parseSeasonName(const char *s);
+unsigned int parseSeasonList(const char *list);
 enum Season resolve_season(const struct config *conf, float *blend_ratio);
 void initBranchList(struct BranchList* list);
 void addBranch(struct BranchList* list, struct Branch branch, struct counters *myCounters);
@@ -336,6 +405,10 @@ void handleResize(struct config *conf, struct ncursesObjects *objects,
 void blitTree(struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane, int trunk_y,
 			  struct BranchList *branchList,
 			  struct ncursesObjects *objects, int off_x, int off_y);
+static void drawTreeFrame(struct config *conf, struct ncursesObjects *objects,
+						  struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
+						  struct BranchList *branchList,
+						  int trunk_x, int trunk_y, int off_x, int off_y);
 int liveStepDisplay(struct config *conf, struct ncursesObjects *objects,
 					struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
 					struct BranchList *branchList,
@@ -388,6 +461,8 @@ void growTree_v2(struct config *conf, struct ncursesObjects *objects, struct cou
 
 // dispatch + entry
 struct TreeEngine get_engine(int version);
+static int readGlyph(const struct ncursesObjects *objects, int y, int x,
+					 wchar_t *wch, attr_t *attrs, short *pair);
 void printTreeToStdout(const struct ncursesObjects *objects);
 char* createDefaultCachePath(void);
 
@@ -675,6 +750,17 @@ void printHelp(void) {
 			"      --season=NAME      force seasonal colors instead of using\n"
 			"                           the date: spring, summer, autumn,\n"
 			"                           late-autumn, winter\n"
+			"      --falling-leaves[=STYLE]\n"
+			"                         let leaves drift down from the tree; STYLE\n"
+			"                           is dots (braille) or lines [default: dots]\n"
+			"      --falling-rate=NUM falling leaves per second [default: 1.1]\n"
+			"      --falling-speed=NUM\n"
+			"                         how fast leaves fall; 2 is twice as fast\n"
+			"                           (0.1-5) [default: 1]\n"
+			"      --falling-seasons=LIST\n"
+			"                         comma-delimited seasons in which leaves\n"
+			"                           fall, e.g. autumn,winter; autumn covers\n"
+			"                           early-autumn and late-autumn [default: all]\n"
 			"  -W, --save=FILE        save progress to file\n"
 			"                           [default: $XDG_CACHE_HOME/cbonsai\n"
 			"                            or $HOME/.cache/cbonsai]\n"
@@ -892,6 +978,29 @@ int parseSeasonName(const char *s) {
 		!strcasecmp(s, "red") || !strcasecmp(s, "late"))           return LATE_FALL;
 	if (!strcasecmp(s, "winter"))                                  return WINTER;
 	return -1;
+}
+
+// Parse a comma-separated --falling-seasons list into a bit mask, or 0 if it is
+// invalid. Here plain "autumn"/"fall" means all of autumn, early and late.
+unsigned int parseSeasonList(const char *list) {
+	char buf[128];
+	if (strlen(list) >= sizeof(buf)) return 0;
+	strcpy(buf, list);
+
+	unsigned int mask = 0;
+	for (char *tok = strtok(buf, ", "); tok; tok = strtok(NULL, ", ")) {
+		if (!strcasecmp(tok, "all")) {
+			mask |= (1u << SPRING) | (1u << SUMMER) | (1u << EARLY_FALL)
+				  | (1u << LATE_FALL) | (1u << WINTER);
+		} else if (!strcasecmp(tok, "autumn") || !strcasecmp(tok, "fall")) {
+			mask |= (1u << EARLY_FALL) | (1u << LATE_FALL);
+		} else {
+			int season = parseSeasonName(tok);
+			if (season < 0) return 0;
+			mask |= 1u << season;
+		}
+	}
+	return mask;
 }
 
 // Resolve the season to colour the tree with: a forced --season (rendered as
@@ -1378,6 +1487,291 @@ void blitTree(struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane, int 
 	}
 }
 
+// --------------------------------------------------------------------------
+// Falling leaves (--falling-leaves): display only. Leaves are drawn onto the
+// tree window after the tree itself and pass behind it, and they draw from
+// their own msaw stream, so they never affect how a tree grows.
+// --------------------------------------------------------------------------
+
+static double wallSeconds(void) {
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+static void sleepSeconds(double seconds) {
+	struct timespec ts;
+	ts.tv_sec = (time_t)seconds;
+	ts.tv_nsec = (long)((seconds - (double)ts.tv_sec) * 1000000000.0);
+	nanosleep(&ts, NULL);
+}
+
+static double fallUniform(struct FallState *f, double lo, double hi) {
+	return lo + (hi - lo) * ((double)msaw_next(&f->rng) / 4294967296.0);
+}
+
+// floor(a / b) for positive b (leaves can have negative coordinates)
+static int floorDiv(int a, int b) {
+	return (a >= 0) ? a / b : -((-a + b - 1) / b);
+}
+
+// Forget all leaves; called before each new tree.
+static void fallReset(struct FallState *f, int seed) {
+	f->count = 0;
+	f->debt = 0;
+	f->lastTime = 0;
+	msaw_seed(&f->rng, (uint64_t)seed ^ MSAW_FALL_SALT);
+}
+
+// Whether window cell (wx, wy) is inside the pot, which is drawn hollow.
+static int insidePot(int baseType, int trunk_x, int trunk_y, int wx, int wy, int off_x, int off_y) {
+	int row = (wy - off_y) - (trunk_y + 1);   // 0 = rim
+	int dx = (wx - off_x) - trunk_x;
+	if (row < 1 || row > 2) return 0;
+	if (baseType == 1) return dx >= -15 + row && dx <= 15 - row;
+	if (baseType == 2) return dx >= -7 + row && dx <= 7 - row;
+	return 0;
+}
+
+// Let one leaf go from a random spot on the underside of the canopy.
+static void fallSpawn(struct FallState *f, const struct ncursesObjects *objects,
+					  int trunk_y, int off_x, int off_y) {
+	if (f->count >= FALL_MAX_LEAVES) return;
+
+	int h, w;
+	getmaxyx(objects->treeWin, h, w);
+
+	wchar_t wch[128];
+	attr_t attrs;
+	short pair, perchPair = 0, belowPair;
+	int perches = 0, perchX = 0, perchY = 0;
+
+	// canopy cells are the ones in leaf colors above the pot (whose rim shares
+	// a leaf color); pick uniformly among those with nothing underneath
+	for (int y = 0; y < h - 1 && y <= trunk_y + off_y; y++) {
+		for (int x = 0; x < w; x++) {
+			if (!readGlyph(objects, y, x, wch, &attrs, &pair)) continue;
+			if (pair != 22 && pair != 23) continue;
+			if (readGlyph(objects, y + 1, x, wch, &attrs, &belowPair)) continue;
+			perches++;
+			if (msaw_below(&f->rng, (uint32_t)perches) == 0) {
+				perchX = x;
+				perchY = y;
+				perchPair = pair;
+			}
+		}
+	}
+	if (perches == 0) return;
+	if ((int)msaw_below(&f->rng, FALL_FULL_CANOPY) >= perches) return;
+
+	struct FallingLeaf *leaf = &f->leaves[f->count++];
+	memset(leaf, 0, sizeof(*leaf));
+	leaf->pathX = (perchX - off_x) * 2 + fallUniform(f, 0.0, 1.0);
+	leaf->pathY = (perchY - off_y) * 4 + 4;
+	leaf->x = leaf->pathX;
+	leaf->y = leaf->pathY;
+	leaf->phase = (msaw_below(&f->rng, 2) ? FALL_PI : 0.0) + fallUniform(f, -0.4, 0.4);
+	leaf->omega = fallUniform(f, 1.7, 2.8);
+	leaf->amp = fallUniform(f, 3.0, 7.5);
+	leaf->lift = fallUniform(f, 0.7, 1.7);
+	leaf->fall = fallUniform(f, FALL_SPEED_MIN, FALL_SPEED_MAX) * f->speed;
+	leaf->slide = fallUniform(f, 2.0, 4.5) * (msaw_below(&f->rng, 2) ? 1.0 : -1.0);
+	leaf->startSin = sin(leaf->phase);
+	leaf->startCos = cos(2.0 * leaf->phase);
+	leaf->tumbles = (msaw_below(&f->rng, FALL_TUMBLE_CHANCE) == 0);
+	leaf->color_pair = perchPair;
+}
+
+// Advance one airborne leaf.
+//
+// Gliders swing like a pendulum: x follows sin(phase) and y gets a
+// cos(2*phase) term, so each swing is a shallow U. The leaf speeds up through
+// the bottom, then slows and hangs as it turns, and is drawn along its
+// direction of travel. Tumblers spin end over end, fall faster, and slide off
+// to one side.
+static void fallMove(struct FallingLeaf *leaf, double dt, double wind) {
+	double oldX = leaf->x, oldY = leaf->y;
+
+	leaf->ease += dt / 1.2;
+	if (leaf->ease > 1.0) leaf->ease = 1.0;
+	leaf->pathX += wind * dt;
+
+	double fallStep = leaf->fall * dt * (0.5 + 0.5 * leaf->ease);
+
+	if (leaf->tumbles) {
+		leaf->phase += leaf->omega * 2.6 * dt;
+		leaf->pathX += leaf->slide * leaf->ease * dt;
+		leaf->pathY += fallStep * 1.35;
+		leaf->x = leaf->pathX + 0.5 * sin(2.0 * leaf->phase);
+		leaf->y = leaf->pathY;
+		leaf->angle = ((int)floor(leaf->phase / (FALL_PI / 4.0)) % 4 + 4) % 4;
+		return;
+	}
+
+	leaf->phase += leaf->omega * dt;
+	leaf->pathY += fallStep;
+	leaf->x = leaf->pathX + leaf->ease * leaf->amp * (sin(leaf->phase) - leaf->startSin);
+	leaf->y = leaf->pathY + leaf->ease * leaf->lift * (cos(2.0 * leaf->phase) - leaf->startCos);
+
+	double vx = leaf->x - oldX, vy = leaf->y - oldY;
+	if (fabs(vy) < 0.6 * fabs(vx))      leaf->angle = 0;
+	else if (fabs(vy) > 3.0 * fabs(vx)) leaf->angle = 2;
+	else                                leaf->angle = (vx * vy < 0) ? 1 : 3;
+}
+
+// Advance the animation to the present. Call right after the tree has been
+// drawn, while the window holds nothing but the tree.
+static void fallUpdate(struct config *conf, const struct ncursesObjects *objects,
+					   int trunk_y, int off_x, int off_y) {
+	struct FallState *f = conf->fall;
+
+	double now = wallSeconds();
+	double dt = (f->lastTime > 0) ? now - f->lastTime : 0.0;
+	f->lastTime = now;
+	if (dt < 0) dt = 0;        // clock was set back
+	if (dt > 0.1) dt = 0.1;    // after a stall, continue rather than jump
+	f->clock += dt;
+
+	int h, w;
+	getmaxyx(objects->treeWin, h, w);
+
+	float blend;
+	if (f->seasons & (1u << resolve_season(conf, &blend))) {
+		f->debt += f->rate * dt * fallUniform(f, 0.3, 1.7);
+		while (f->debt >= 1.0) {
+			f->debt -= 1.0;
+			fallSpawn(f, objects, trunk_y, off_x, off_y);
+		}
+	}
+
+	double t = f->clock;
+	double wind = FALL_BREEZE * (0.4 + 0.5 * sin(0.31 * t) + 0.35 * sin(0.83 * t + 1.3));
+	int rimRow = (getBaseHeight(conf->baseType) > 0) ? trunk_y + off_y + 1 : -1;
+
+	wchar_t wch[128];
+	attr_t attrs;
+	short pair;
+
+	int kept = 0;
+	for (int i = 0; i < f->count; i++) {
+		struct FallingLeaf leaf = f->leaves[i];
+
+		if (leaf.resting) {
+			leaf.rest -= dt;
+			if (leaf.rest <= 0) continue;
+		} else {
+			fallMove(&leaf, dt, wind);
+			int wx = floorDiv((int)floor(leaf.x), 2) + off_x;
+			int wy = floorDiv((int)floor(leaf.y), 4) + off_y;
+			if (wx < -10 || wx > w + 10) continue;
+
+			int landRow = -1;
+			if (wy >= h - 1)
+				landRow = h - 1;
+			else if (rimRow > 0 && wy == rimRow - 1
+					 && readGlyph(objects, rimRow, wx, wch, &attrs, &pair))
+				landRow = wy;
+
+			if (landRow >= 0) {
+				leaf.resting = 1;
+				leaf.rest = fallUniform(f, 3.0, 9.0);
+				leaf.angle = 0;
+				leaf.y = (landRow - off_y) * 4 + 3;
+			}
+		}
+		f->leaves[kept++] = leaf;
+	}
+	f->count = kept;
+}
+
+// Draw the leaves onto the tree window, only where the tree left it blank.
+static void fallDraw(const struct config *conf, const struct ncursesObjects *objects,
+					 int trunk_x, int trunk_y, int off_x, int off_y) {
+	// braille dot bits by [row][column] within a cell
+	static const int dotBit[4][2] = { {0x01, 0x08}, {0x02, 0x10}, {0x04, 0x20}, {0x40, 0x80} };
+	// the two dots of a leaf at each angle, as (x, y) offsets
+	static const int dots[4][2][2] = {
+		{ {0, 0}, {1, 0} }, { {0, 1}, {1, 0} }, { {0, 0}, {0, 1} }, { {0, 0}, {1, 1} }
+	};
+	static const char *const lines[4] = { "-", "/", "|", "\\" };
+
+	const struct FallState *f = conf->fall;
+
+	// dots sharing a cell have to be merged into a single glyph
+	struct { int x, y, mask; short pair; } cells[FALL_MAX_LEAVES * 2];
+	int cellCount = 0;
+
+	int h, w;
+	getmaxyx(objects->treeWin, h, w);
+
+	wchar_t wch[128];
+	attr_t attrs;
+	short pair;
+
+	for (int i = 0; i < f->count; i++) {
+		const struct FallingLeaf *leaf = &f->leaves[i];
+		int px = (int)floor(leaf->x) + off_x * 2;
+		int py = (int)floor(leaf->y) + off_y * 4;
+		// a leaf on the ground turns gray before it disappears
+		short leafPair = (leaf->resting && leaf->rest < 1.5) ? 8 : leaf->color_pair;
+
+		int pieces = (f->style == FALL_LINES) ? 1 : 2;
+		for (int d = 0; d < pieces; d++) {
+			int x = px, y = py;
+			if (f->style == FALL_DOTS) {
+				x += dots[leaf->angle][d][0];
+				y += dots[leaf->angle][d][1];
+			}
+			int wx = floorDiv(x, 2), wy = floorDiv(y, 4);
+			if (wx < 0 || wx >= w || wy < 0 || wy >= h) continue;
+
+			int bit = (f->style == FALL_LINES) ? leaf->angle : dotBit[y - wy * 4][x - wx * 2];
+
+			int c = 0;
+			while (c < cellCount && (cells[c].x != wx || cells[c].y != wy)) c++;
+			if (c == cellCount) {
+				cells[c].x = wx;
+				cells[c].y = wy;
+				cells[c].mask = 0;
+				cellCount++;
+			}
+			cells[c].mask = (f->style == FALL_LINES) ? bit : (cells[c].mask | bit);
+			cells[c].pair = leafPair;
+		}
+	}
+
+	for (int c = 0; c < cellCount; c++) {
+		int wx = cells[c].x, wy = cells[c].y;
+		if (readGlyph(objects, wy, wx, wch, &attrs, &pair)) continue;
+		if (insidePot(conf->baseType, trunk_x, trunk_y, wx, wy, off_x, off_y)) continue;
+
+		char glyph[4] = {0};
+		if (f->style == FALL_LINES) {
+			glyph[0] = lines[cells[c].mask][0];
+		} else {
+			// U+2800 + mask as UTF-8
+			glyph[0] = (char)0xE2;
+			glyph[1] = (char)(0xA0 | (cells[c].mask >> 6));
+			glyph[2] = (char)(0x80 | (cells[c].mask & 0x3F));
+		}
+		wattron(objects->treeWin, COLOR_PAIR(cells[c].pair));
+		mvwaddstr(objects->treeWin, wy, wx, glyph);
+		wattroff(objects->treeWin, COLOR_PAIR(cells[c].pair));
+	}
+}
+
+// Draw the tree, plus falling leaves when they are enabled.
+static void drawTreeFrame(struct config *conf, struct ncursesObjects *objects,
+						  struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
+						  struct BranchList *branchList,
+						  int trunk_x, int trunk_y, int off_x, int off_y) {
+	blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, off_x, off_y);
+	if (conf->fall) {
+		fallUpdate(conf, objects, trunk_y, off_x, off_y);
+		fallDraw(conf, objects, trunk_x, trunk_y, off_x, off_y);
+	}
+}
+
 // One live-mode display step: blit, verbose output, screen update, then
 // sleep conf->timeStep while handling message timeout, quit and resize.
 // RNG-free: shared by all engines. Returns 1 if the user quit (caller
@@ -1390,7 +1784,7 @@ int liveStepDisplay(struct config *conf, struct ncursesObjects *objects,
 					int *off_x, int *off_y, int maxX, int maxY, int turn) {
 	if (conf->no_disp) return 0;
 
-	blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, *off_x, *off_y);
+	drawTreeFrame(conf, objects, skeleton, trunkPlane, branchList, trunk_x, trunk_y, *off_x, *off_y);
 	if (conf->verbosity > 0) {
 		struct Branch *db = &branchList->branches[turn > 0 ? turn - 1 : 0];
 		mvwprintw(objects->treeWin, 2, 5, "maxX: %03d, maxY: %03d", maxX, maxY);
@@ -1404,9 +1798,12 @@ int liveStepDisplay(struct config *conf, struct ncursesObjects *objects,
 	update_panels();
 	doupdate();
 
-	float remaining = conf->timeStep;
+	double remaining = conf->timeStep;
 	while (remaining > 0) {
-		float sleepTime = (remaining > 0.2f) ? 0.2f : remaining;
+		// slow growth (e.g. named trees) still needs frames for falling leaves
+		double iterStart = wallSeconds();
+		double maxSleep = conf->fall ? FALL_FRAME_TIME : 0.2;
+		double sleepTime = (remaining > maxSleep) ? maxSleep : remaining;
 
 		if (conf->messageTimeout > 0 && conf->message != NULL && objects->messagePanel != NULL) {
 			if (time(NULL) - conf->messageStartTime >= conf->messageTimeout) {
@@ -1417,19 +1814,29 @@ int liveStepDisplay(struct config *conf, struct ncursesObjects *objects,
 
 		struct timespec ts;
 		ts.tv_sec = (time_t)(sleepTime);
-		ts.tv_nsec = (long)((sleepTime - ts.tv_sec) * 1000000000);
+		ts.tv_nsec = (long)((sleepTime - (double)ts.tv_sec) * 1000000000);
 		nanosleep(&ts, NULL);
 
 		int key = checkKeyPress(conf, myCounters);
 		if (key == 1) return 1;
 		if (key == 2) {
 			handleResize(conf, objects, trunk_x, trunk_y, baseHeight, off_x, off_y);
-			blitTree(skeleton, trunkPlane, trunk_y, branchList, objects, *off_x, *off_y);
+			drawTreeFrame(conf, objects, skeleton, trunkPlane, branchList, trunk_x, trunk_y, *off_x, *off_y);
 			update_panels();
 			doupdate();
 		}
 
 		remaining -= sleepTime;
+
+		if (conf->fall && remaining > 0) {
+			drawTreeFrame(conf, objects, skeleton, trunkPlane, branchList, trunk_x, trunk_y, *off_x, *off_y);
+			update_panels();
+			doupdate();
+
+			// count the time spent drawing too, so that frames don't slow growth
+			double extra = wallSeconds() - iterStart - sleepTime;
+			if (extra > 0 && extra < 1.0) remaining -= extra;
+		}
 	}
 	return 0;
 }
@@ -1440,7 +1847,35 @@ void finalHold(struct config *conf, struct ncursesObjects *objects,
 			   struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
 			   struct BranchList *branchList,
 			   int trunk_x, int trunk_y, int baseHeight, int *off_x, int *off_y) {
-	if (conf->no_disp || conf->infinite || conf->printTree) return;
+	if (conf->no_disp || conf->printTree) return;
+
+	// with falling leaves the finished tree keeps moving; in infinite mode this
+	// also takes the place of main()'s wait between trees
+	if (conf->fall) {
+		double start = conf->fall->clock;
+		nodelay(stdscr, TRUE);
+		while (1) {
+			drawTreeFrame(conf, objects, skeleton, trunkPlane, branchList, trunk_x, trunk_y, *off_x, *off_y);
+			update_panels();
+			doupdate();
+			sleepSeconds(FALL_FRAME_TIME);
+
+			int ch = wgetch(stdscr);
+			if (ch == KEY_RESIZE) {
+				handleResize(conf, objects, trunk_x, trunk_y, baseHeight, off_x, off_y);
+			} else if (conf->infinite) {
+				if (ch == 'q' || (conf->screensaver && ch != ERR)) {
+					conf->quitRequested = 1;
+					return;
+				}
+				if (conf->fall->clock - start >= conf->timeWait) return;
+			} else if (ch != ERR) {
+				return;
+			}
+		}
+	}
+
+	if (conf->infinite) return;
 
 	nodelay(stdscr, FALSE);
 	while (wgetch(stdscr) == KEY_RESIZE) {
@@ -3257,6 +3692,14 @@ void growTree_v2(struct config *conf, struct ncursesObjects *objects, struct cou
 
 #define OPT_VERSION 1003
 
+#define OPT_FALL 1004
+
+#define OPT_FALL_RATE 1005
+
+#define OPT_FALL_SPEED 1006
+
+#define OPT_FALL_SEASONS 1007
+
 struct TreeEngine get_engine(int version) {
 	struct TreeEngine engine;
 	switch (version) {
@@ -3445,12 +3888,24 @@ int main(int argc, char* argv[]) {
 		{"bare", no_argument, NULL, OPT_BARE},
 		{"season", required_argument, NULL, OPT_SEASON},
 		{"version", no_argument, NULL, OPT_VERSION},
+		{"falling-leaves", optional_argument, NULL, OPT_FALL},
+		{"falling-rate", required_argument, NULL, OPT_FALL_RATE},
+		{"falling-speed", required_argument, NULL, OPT_FALL_SPEED},
+		{"falling-seasons", required_argument, NULL, OPT_FALL_SEASONS},
 		{0, 0, 0, 0}
 	};
 
 	struct ncursesObjects objects = {0};
 
 	char leavesInput[128] = "█,█,█,▒,▒";
+
+	static struct FallState fallState = {
+		.style = FALL_DOTS,
+		.rate = FALL_RATE_DEFAULT,
+		.speed = FALL_SPEED_DEFAULT,
+		.seasons = ~0u,
+	};
+	int fallStyleGiven = 0;
 
 	// parse arguments
 	int option_index = 0;
@@ -3634,6 +4089,53 @@ int main(int argc, char* argv[]) {
 			}
 			break;
 
+		case OPT_FALL: {
+			// the style is optional: --falling-leaves, --falling-leaves=lines
+			// and --falling-leaves lines all work
+			const char *style = optarg;
+			if (!style && optind < argc
+				&& (!strcmp(argv[optind], "dots") || !strcmp(argv[optind], "lines")))
+				style = argv[optind++];
+
+			if (style && !strcmp(style, "dots")) fallState.style = FALL_DOTS;
+			else if (style && !strcmp(style, "lines")) fallState.style = FALL_LINES;
+			else if (style) {
+				printf("error: invalid falling leaves style: '%s' (try dots, lines)\n", style);
+				quit(&conf, &objects, 1);
+			}
+			if (style) fallStyleGiven = 1;
+			conf.fall = &fallState;
+			break;
+		}
+
+		case OPT_FALL_RATE: {
+			char *end;
+			fallState.rate = strtod(optarg, &end);
+			if (end == optarg || *end || !(fallState.rate > 0 && fallState.rate <= 20)) {
+				printf("error: invalid falling rate: '%s' (leaves per second, up to 20)\n", optarg);
+				quit(&conf, &objects, 1);
+			}
+			break;
+		}
+
+		case OPT_FALL_SPEED: {
+			char *end;
+			fallState.speed = strtod(optarg, &end);
+			if (end == optarg || *end || !(fallState.speed >= 0.1 && fallState.speed <= 5)) {
+				printf("error: invalid falling speed: '%s' (0.1-5)\n", optarg);
+				quit(&conf, &objects, 1);
+			}
+			break;
+		}
+
+		case OPT_FALL_SEASONS:
+			fallState.seasons = parseSeasonList(optarg);
+			if (!fallState.seasons) {
+				printf("error: invalid season list: '%s' (try spring, summer, autumn, early-autumn, late-autumn, winter, all)\n", optarg);
+				quit(&conf, &objects, 1);
+			}
+			break;
+
 		case OPT_VERSION:
 			printf("cbonsai %s\n", CBONSAI_VERSION);
 			quit(&conf, &objects, 0);
@@ -3678,6 +4180,13 @@ int main(int argc, char* argv[]) {
 		conf.leavesSize++;
 	}
 
+	// no braille without a multibyte locale, nor usually on the Linux console
+	if (conf.fall && !fallStyleGiven) {
+		const char *term = getenv("TERM");
+		if (MB_CUR_MAX < 2 || (term && !strcmp(term, "linux")))
+			fallState.style = FALL_LINES;
+	}
+
 	if (conf.load)
 		loadFromFile(&conf);
 
@@ -3710,14 +4219,22 @@ int main(int argc, char* argv[]) {
 
 	do {
 		init(&conf, &objects);
+		if (conf.fall) fallReset(conf.fall, conf.seed);
 		get_engine(conf.version).growTree(&conf, &objects, &myCounters);
 		if (conf.load) conf.targetGlobalTime = 0;
+		if (conf.quitRequested) {
+			finish(&conf, &myCounters);
+			quit(&conf, &objects, 0);
+		}
 		if (conf.infinite) {
-			timeout(conf.timeWait * 1000);
-			int key = checkKeyPress(&conf, &myCounters);
-			if (key == 1)
-				quit(&conf, &objects, 0);
-			// key == 2 (resize): next iteration calls init() which rebuilds windows
+			// with falling leaves, finalHold() has already waited
+			if (!conf.fall) {
+				timeout(conf.timeWait * 1000);
+				int key = checkKeyPress(&conf, &myCounters);
+				if (key == 1)
+					quit(&conf, &objects, 0);
+				// key == 2 (resize): next iteration calls init() which rebuilds windows
+			}
 
 			conf.seed = time(NULL);
 			srand(conf.seed);

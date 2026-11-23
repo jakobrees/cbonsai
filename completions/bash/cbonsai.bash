@@ -39,6 +39,10 @@ _cbonsai()
     '--engine'
     '--bare'
     '--season'
+    '--falling-leaves'
+    '--falling-rate'
+    '--falling-speed'
+    '--falling-seasons'
     '-W'
     '--save'
     '-C'
@@ -57,6 +61,17 @@ _cbonsai()
       ;;
     --engine)
       COMPREPLY=($(compgen -W "1 2" -- "$cur"))
+      return
+      ;;
+    --falling-leaves)
+      COMPREPLY=($(compgen -W "dots lines ${opts[*]}" -- "$cur"))
+      return
+      ;;
+    --falling-rate|--falling-speed)
+      return
+      ;;
+    --falling-seasons)
+      COMPREPLY=($(compgen -W "all spring summer autumn early-autumn late-autumn winter" -- "$cur"))
       return
       ;;
     --season)

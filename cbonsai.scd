@@ -68,6 +68,18 @@ cbonsai is an advanced bonsai tree generator with seasonal color changes, proced
 *--season*=_NAME_
 	force the seasonal color palette instead of choosing it from the current date. NAME is one of: _spring_, _summer_, _autumn_ (yellow), _late-autumn_ (deep red), _winter_. The forced season is rendered as its pure color, without the smooth date-driven blend between seasons.
 
+*--falling-leaves*[=_STYLE_]
+	let leaves drift down from the tree. _STYLE_ is _dots_ (braille) or _lines_ (ASCII) [default: dots, or lines where braille is unavailable]. Off unless given. Does not change how the tree grows.
+
+*--falling-rate*=_NUM_
+	falling leaves per second, up to 20 [default: 1.1]. Small canopies shed proportionally less.
+
+*--falling-speed*=_NUM_
+	how fast leaves fall; 2 is twice as fast (0.1-5) [default: 1]
+
+*--falling-seasons*=_LIST_
+	comma-delimited seasons in which leaves fall: _spring_, _summer_, _autumn_, _early-autumn_, _late-autumn_, _winter_, _all_ [default: all]. _autumn_ covers both early and late autumn.
+
 *-W*, *--save*=_FILE_
 	save progress to file [default: ~/.cache/cbonsai]
 

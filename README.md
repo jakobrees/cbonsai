@@ -46,6 +46,8 @@ A giant tree, with a message alongside it:
   bleached wood.
 - **Seasonal color** — spring greens through summer depth, autumn yellows and
   reds, winter whites; automatic by date or pinned with `--season`.
+- **Falling leaves** — leaves flutter and tumble down from the canopy, in the
+  seasons you choose (`--falling-leaves`, off by default).
 - **Live growth** — watch each step, at a speed you choose.
 - **Named, persistent trees** — a tree can grow over days or weeks of real time,
   even while the program isn't running.
@@ -142,6 +144,17 @@ Options:
                            (v2 engine only; same tree, leaves hidden)
       --season=NAME      force seasonal colors instead of using the date:
                            spring, summer, autumn, late-autumn, winter
+      --falling-leaves[=STYLE]
+                         let leaves drift down from the tree; STYLE
+                           is dots (braille) or lines [default: dots]
+      --falling-rate=NUM falling leaves per second [default: 1.1]
+      --falling-speed=NUM
+                         how fast leaves fall; 2 is twice as fast
+                           (0.1-5) [default: 1]
+      --falling-seasons=LIST
+                         comma-delimited seasons in which leaves
+                           fall, e.g. autumn,winter; autumn covers
+                           early-autumn and late-autumn [default: all]
   -W, --save=FILE        save progress to file [default: ~/.cache/cbonsai]
   -C, --load=FILE        load progress from file [default: ~/.cache/cbonsai]
   -v, --verbose          increase output verbosity
@@ -186,6 +199,17 @@ cbonsai -C ~/my_tree
 ```bash
 # Saves/loads automatically; quits on any keypress
 cbonsai -S
+```
+
+### Falling leaves
+
+```bash
+# Leaves drift down from the canopy, as braille dots or as lines
+cbonsai -S --falling-leaves
+cbonsai -S --falling-leaves=lines
+
+# Only in autumn and winter, and fewer of them
+cbonsai -S --falling-leaves --falling-seasons=autumn,winter --falling-rate=0.5
 ```
 
 ### A bonsai in every terminal

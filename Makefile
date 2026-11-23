@@ -37,6 +37,7 @@ else ifeq ($(OS),Darwin)
 else
     LDLIBS  += -lpanelw -lncursesw -ltinfo
 endif
+LDLIBS += -lm
 
 # Default target
 .DEFAULT_GOAL := all
