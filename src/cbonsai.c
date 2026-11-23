@@ -130,6 +130,14 @@
 #define FALL_GRASS_SINK     1
 #endif
 
+// Messages: a line break is treated as hard wrapping (and the lines rejoined)
+// when the next word would have taken the line past this many columns. Shorter
+// lines are assumed to be broken on purpose, as in lists and poems.
+#define MSG_JOIN_WIDTH 60
+
+// deepest indentation kept in a message (attributions are often tabbed far in)
+#define MSG_MAX_INDENT 2
+
 // seconds between animation frames
 #define FALL_FRAME_TIME     (1.0 / 30.0)
 
@@ -167,6 +175,12 @@
 // ==========================================================================
 
 enum branchType {trunk, shootLeft, shootRight, dying, dead};
+
+// a run of message text: a paragraph, or one line of one after wrapping
+struct MessageSpan {
+	int start, len;
+	int indent;
+};
 
 enum fallStyle {FALL_DOTS, FALL_LINES};
 
@@ -422,8 +436,6 @@ static inline void get_average_position(struct Branch* branch, int* avg_x, int* 
 static inline int isEarlyTrunk(int age, int totalLife);
 static inline int isYoungTrunk(int age, int totalLife);
 static inline int getBranchRollThreshold(int age, int totalLife, int multiplier);
-void addSpaces(WINDOW* messageWin, int count, int *linePosition, int maxWidth);
-int createMessageWindows(struct ncursesObjects *objects, char* message);
 int drawMessage(struct config *conf, struct ncursesObjects *objects, char* message);
 void clearMessage(struct ncursesObjects *objects);
 void init(struct config *conf, struct ncursesObjects *objects);
@@ -1143,172 +1155,249 @@ static inline int getBranchRollThreshold(int age, int totalLife, int multiplier)
 	return dice;
 }
 
-void addSpaces(WINDOW* messageWin, int count, int *linePosition, int maxWidth) {
-	// add spaces if there's enough space
-	if (*linePosition < (maxWidth - count)) {
-		/* if (verbosity) mvwprintw(treeWin, 12, 5, "inserting a space: linePosition: %02d", *linePosition); */
+// --------------------------------------------------------------------------
+// Message box: parse into paragraphs, wrap, then size the box to fit
+// --------------------------------------------------------------------------
 
-		// add spaces up to width
-		for (int j = 0; j < count; j++) {
-			wprintw(messageWin, " ");
-			(*linePosition)++;
-		}
-	}
+static int wideWidth(wchar_t wc) {
+	int w = wcwidth(wc);
+	return (w > 0) ? w : 0;
 }
 
-// create ncurses windows to contain message and message box
-// returns 0 on success, 1 if terminal too small
-int createMessageWindows(struct ncursesObjects *objects, char* message) {
-	int maxY, maxX;
-	getmaxyx(stdscr, maxY, maxX);
+static int spanWidth(const wchar_t *text, int start, int len) {
+	int w = 0;
+	for (int i = 0; i < len; i++) w += wideWidth(text[start + i]);
+	return w;
+}
 
-	if (maxX < 10 || maxY < 4) {
-		objects->messageBorderWin = NULL;
-		objects->messageWin = NULL;
-		objects->messageBorderPanel = NULL;
-		objects->messagePanel = NULL;
-		return 1;
+// Decode a message, dropping what can't be shown in a box: escape sequences,
+// control characters, and overstrikes ("_\b"). Tabs are kept for the parser.
+static wchar_t *decodeMessage(const char *message) {
+	size_t size = strlen(message);
+	wchar_t *out = malloc((size + 1) * sizeof(wchar_t));
+	if (!out) return NULL;
+
+	mbstate_t ps;
+	memset(&ps, 0, sizeof(ps));
+	size_t n = 0, i = 0;
+	while (i < size) {
+		if (message[i] == '\033') {
+			i++;
+			if (i < size && message[i] == '[') {
+				i++;
+				while (i < size && !(message[i] >= '@' && message[i] <= '~')) i++;
+				if (i < size) i++;
+			} else if (i < size) {
+				i++;
+			}
+			continue;
+		}
+		wchar_t wc;
+		size_t used = mbrtowc(&wc, message + i, size - i, &ps);
+		if (used == (size_t)-1 || used == (size_t)-2 || used == 0) {
+			memset(&ps, 0, sizeof(ps));
+			wc = L'?';
+			used = 1;
+		}
+		i += used;
+		if (wc == L'\b') {
+			if (n > 0) n--;
+		} else if (wc == L'\n' || wc == L'\t' || wcwidth(wc) >= 0) {
+			out[n++] = wc;
+		}
 	}
+	out[n] = L'\0';
+	return out;
+}
 
-	int boxWidth = 0;
-	int boxHeight = 0;
+// Split text into paragraphs, rejoining hard-wrapped lines. The result's spans
+// index into *joined. Both arrays must hold one entry per character, plus two.
+static int parseMessage(const wchar_t *text, wchar_t *joined, struct MessageSpan *paras) {
+	int count = 0, out = 0;
+	int lastWidth = 0;   // width of the source line that ended the open paragraph
+	int lastIndent = -1; // its indentation, or -1 if there is no open paragraph
+	int blanks = 0;
 
-	if (strlen(message) + 3 <= (0.25 * maxX)) {
-		boxWidth = strlen(message) + 1;
-		boxHeight = 1;
-	} else {
-		boxWidth = 0.25 * maxX;
-		if (boxWidth < 4) boxWidth = 4;
-		boxHeight = (strlen(message) / boxWidth) + (strlen(message) / boxWidth);
+	const wchar_t *p = text;
+	while (*p) {
+		int indent = 0;
+		while (*p == L' ' || *p == L'\t') {
+			indent += (*p == L'\t') ? 8 - indent % 8 : 1;
+			p++;
+		}
+		const wchar_t *line = p;
+		while (*p && *p != L'\n') p++;
+		int len = (int)(p - line);
+		if (*p == L'\n') p++;
+		while (len > 0 && (line[len - 1] == L' ' || line[len - 1] == L'\t')) len--;
+
+		if (len == 0) {
+			blanks = 1;
+			lastIndent = -1;
+			continue;
+		}
+		// keep one blank line between paragraphs, none before the first
+		if (blanks && count > 0) {
+			paras[count].start = out;
+			paras[count].len = 0;
+			paras[count].indent = 0;
+			count++;
+		}
+		blanks = 0;
+
+		int firstWord = 0;
+		while (firstWord < len && line[firstWord] != L' ' && line[firstWord] != L'\t') firstWord++;
+		int attribution = (len > 1 && line[0] == L'-' && line[1] == L'-');
+
+		// indented less than the line before: that one's indent was only a
+		// first-line indent; indented more: a new paragraph starts here
+		int join = (lastIndent >= 0 && indent <= lastIndent && !attribution
+					&& lastWidth + 1 + spanWidth(line, 0, firstWord) > MSG_JOIN_WIDTH);
+		if (join) {
+			joined[out++] = L' ';
+			paras[count - 1].len++;
+			if (indent < paras[count - 1].indent) paras[count - 1].indent = indent;
+		} else {
+			paras[count].start = out;
+			paras[count].len = 0;
+			paras[count].indent = (indent < MSG_MAX_INDENT) ? indent : MSG_MAX_INDENT;
+			count++;
+		}
+		for (int i = 0; i < len; i++) joined[out++] = (line[i] == L'\t') ? L' ' : line[i];
+		paras[count - 1].len += len;
+		lastWidth = indent + spanWidth(line, 0, len);
+		lastIndent = indent;
 	}
+	return count;
+}
 
-	int borderW = boxWidth + 4;
-	int borderH = boxHeight + 2;
-	int borderY = (int)(maxY * 0.3) - 1;
-	int borderX = (int)(maxX * 0.7) - 2;
+// Wrap paragraphs to `width` columns. Returns the number of lines, storing
+// them in lines[] and the number of words that had to be split in *splits,
+// unless those are NULL.
+static int wrapMessage(const wchar_t *text, const struct MessageSpan *paras, int count,
+					   int width, struct MessageSpan *lines, int *splits) {
+	int n = 0;
+	if (splits) *splits = 0;
+	for (int k = 0; k < count; k++) {
+		int pos = paras[k].start, end = paras[k].start + paras[k].len;
+		int indent = (width - paras[k].indent >= 4) ? paras[k].indent : 0;
+		int avail = width - indent;
 
-	if (borderY < 0) borderY = 0;
-	if (borderX < 0) borderX = 0;
-	if (borderX + borderW > maxX) borderW = maxX - borderX;
-	if (borderY + borderH > maxY) borderH = maxY - borderY;
-	if (borderW < 3 || borderH < 3) {
-		objects->messageBorderWin = NULL;
-		objects->messageWin = NULL;
-		objects->messageBorderPanel = NULL;
-		objects->messagePanel = NULL;
-		return 1;
+		do {
+			int w = 0, i = pos, lastSpace = -1;
+			while (i < end && w + wideWidth(text[i]) <= avail) {
+				if (text[i] == L' ') lastSpace = i;
+				w += wideWidth(text[i]);
+				i++;
+			}
+			int stop = i;
+			if (i < end && text[i] != L' ') {
+				if (lastSpace > pos) stop = lastSpace;   // break between words
+				else {
+					if (i == pos) stop = pos + 1;        // always make progress
+					if (splits) (*splits)++;
+				}
+			}
+			int len = stop - pos;
+			while (len > 0 && text[pos + len - 1] == L' ') len--;
+			if (lines) {
+				lines[n].start = pos;
+				lines[n].len = len;
+				lines[n].indent = indent;
+			}
+			n++;
+			pos = stop;
+			while (pos < end && text[pos] == L' ') pos++;
+		} while (pos < end);
 	}
+	return n;
+}
 
-	int msgW = borderW - 3;
-	int msgH = borderH - 2;
-	int msgY = borderY + 1;
-	int msgX = borderX + 2;
-
-	objects->messageBorderWin = newwin(borderH, borderW, borderY, borderX);
-	objects->messageWin = newwin(msgH, msgW, msgY, msgX);
-
-	wattron(objects->messageBorderWin, COLOR_PAIR(8) | A_BOLD);
-	wborder(objects->messageBorderWin, '|', '|', '-', '-', '+', '+', '+', '+');
-
-	objects->messageBorderPanel = new_panel(objects->messageBorderWin);
-	objects->messagePanel = new_panel(objects->messageWin);
-	return 0;
+// Draw one wrapped line. Goes through a multibyte string, the only kind of
+// text the web build's curses shim draws.
+static void drawMessageLine(WINDOW *win, int y, const wchar_t *text, const struct MessageSpan *line) {
+	char buf[16];
+	int x = line->indent;
+	for (int i = 0; i < line->len; i++) {
+		wchar_t wc = text[line->start + i];
+		mbstate_t ps;
+		memset(&ps, 0, sizeof(ps));
+		size_t n = wcrtomb(buf, wc, &ps);
+		if (n == (size_t)-1 || n >= sizeof(buf)) continue;
+		buf[n] = '\0';
+		// a combining mark has no width: add it to the cell just drawn
+		if (wideWidth(wc) == 0) waddstr(win, buf);
+		else mvwaddstr(win, y, x, buf);
+		x += wideWidth(wc);
+	}
 }
 
 int drawMessage(struct config *conf, struct ncursesObjects *objects, char* message) {
 	if (!message) return 1;
 
 	conf->messageStartTime = time(NULL);
-	if (createMessageWindows(objects, message) != 0) return 1;
 
-	int maxWidth = getmaxx(objects->messageWin) - 2;
+	int maxY, maxX;
+	getmaxyx(stdscr, maxY, maxX);
+	if (maxX < 10 || maxY < 4) return 1;
 
-	// word wrap message as it is written
-	unsigned int i = 0;
-	int linePosition = 0;
-	int wordLength = 0;
-	char wordBuffer[512] = {'\0'};
-	char thisChar;
-	while (true) {
-		thisChar = message[i];
-		if (conf->verbosity) {
-			mvwprintw(objects->treeWin, 9, 5, "index: %03d", i);
-			mvwprintw(objects->treeWin, 10, 5, "linePosition: %02d", linePosition);
+	wchar_t *text = decodeMessage(message);
+	size_t size = text ? wcslen(text) + 2 : 0;
+	wchar_t *joined = malloc(size * sizeof(wchar_t) + 1);
+	struct MessageSpan *paras = malloc(size * sizeof(*paras) + 1);
+	struct MessageSpan *lines = malloc(2 * size * sizeof(*lines) + 1);
+	int count = 0;
+	if (text && joined && paras && lines) count = parseMessage(text, joined, paras);
+
+	if (count > 0) {
+		// the box goes to the right of the tree; a long message widens it, up
+		// to half the screen, before it is cut short
+		int borderX = (int)(maxX * 0.7) - 2;
+		if (borderX < 0) borderX = 0;
+		int width = maxX - borderX - 4;
+		int limit = maxX / 2 - 4;
+		if (width < 4) width = 4;
+		if (width > maxX - 4) width = maxX - 4;
+
+		int splits, rows = wrapMessage(joined, paras, count, width, NULL, &splits);
+		while (rows > maxY - 2 && width < limit)
+			rows = wrapMessage(joined, paras, count, ++width, NULL, &splits);
+
+		// shrink to fit, as long as that adds no lines and splits no more words
+		int narrowSplits;
+		while (width > 1
+			   && wrapMessage(joined, paras, count, width - 1, NULL, &narrowSplits) == rows
+			   && narrowSplits <= splits)
+			width--;
+		wrapMessage(joined, paras, count, width, lines, NULL);
+
+		int shown = (rows > maxY - 2) ? maxY - 2 : rows;
+		int borderW = width + 4, borderH = shown + 2;
+		if (borderX + borderW > maxX) borderX = maxX - borderW;
+		int borderY = (int)(maxY * 0.3) - 1;
+		if (borderY + borderH > maxY) borderY = maxY - borderH;
+		if (borderY < 0) borderY = 0;
+
+		objects->messageBorderWin = newwin(borderH, borderW, borderY, borderX);
+		objects->messageWin = newwin(shown, width, borderY + 1, borderX + 2);
+
+		wattron(objects->messageBorderWin, COLOR_PAIR(8) | A_BOLD);
+		wborder(objects->messageBorderWin, '|', '|', '-', '-', '+', '+', '+', '+');
+
+		for (int i = 0; i < shown; i++) {
+			if (i == shown - 1 && shown < rows) mvwaddstr(objects->messageWin, i, 0, "...");
+			else drawMessageLine(objects->messageWin, i, joined, &lines[i]);
 		}
 
-		// a word too long for the buffer is printed in pieces
-		if (wordLength >= (int) sizeof(wordBuffer) - 1) {
-			wprintw(objects->messageWin, "%s", wordBuffer);
-			wordLength = 0;
-			wordBuffer[0] = '\0';
-		}
-
-		// append this character to word buffer,
-		// if it's not space or NULL and it can fit
-		if (!(isspace(thisChar) || thisChar == '\0') && wordLength < (int) sizeof(wordBuffer) - 1) {
-			strncat(wordBuffer, &thisChar, 1);
-			wordLength++;
-			linePosition++;
-		}
-
-		// if char is space or null char
-		else if (isspace(thisChar) || thisChar == '\0') {
-
-			// if current line can fit word, add word to current line
-			if (linePosition <= maxWidth) {
-				wprintw(objects->messageWin, "%s", wordBuffer);	// print word
-				wordLength = 0;		// reset word length
-				wordBuffer[0] = '\0';	// clear word buffer
-
-				switch (thisChar) {
-				case ' ':
-					addSpaces(objects->messageWin, 1, &linePosition, maxWidth);
-					break;
-				case '\t':
-					addSpaces(objects->messageWin, 1, &linePosition, maxWidth);
-					break;
-				case '\n':
-					waddch(objects->messageWin, thisChar);
-					linePosition = 0;
-					break;
-				}
-
-			}
-
-			// if word can't fit within a single line, just print it
-			else if (wordLength > maxWidth) {
-				wprintw(objects->messageWin, "%s ", wordBuffer);	// print word
-				wordLength = 0;		// reset word length
-				wordBuffer[0] = '\0';	// clear word buffer
-
-				// our line position on this new line is the x coordinate
-				int y;
-				(void) y;
-				getyx(objects->messageWin, y, linePosition);
-			}
-
-			// if current line can't fit word, go to next line
-			else {
-				if (conf->verbosity) mvwprintw(objects->treeWin, (i / 24) + 28, 5, "couldn't fit word. linePosition: %02d, wordLength: %02d", linePosition, wordLength);
-				wprintw(objects->messageWin, "\n%s ", wordBuffer); // print newline, then word
-				linePosition = wordLength;	// reset line position
-				wordLength = 0;		// reset word length
-				wordBuffer[0] = '\0';	// clear word buffer
-			}
-		}
-		else {
-			printf("%s", "Error while parsing message");
-			return 1;
-		}
-
-		if (conf->verbosity >= 2) {
-			updateScreen(1);
-			mvwprintw(objects->treeWin, 11, 5, "word buffer: |%15s|", wordBuffer);
-		}
-		if (thisChar == '\0') break;	// quit when we reach the end of the message
-		i++;
+		objects->messageBorderPanel = new_panel(objects->messageBorderWin);
+		objects->messagePanel = new_panel(objects->messageWin);
 	}
-	return 0;
+
+	free(text);
+	free(joined);
+	free(paras);
+	free(lines);
+	return (count > 0) ? 0 : 1;
 }
 
 void clearMessage(struct ncursesObjects *objects) {
