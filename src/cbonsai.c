@@ -1186,6 +1186,42 @@ void clearMessage(struct ncursesObjects *objects) {
 	doupdate();
 }
 
+// Nearest fixed xterm-256 palette slot (16-255) to an ncurses 0-1000 RGB color,
+// skipping slots already in taken[] so every color keeps a slot of its own.
+static short nearestXterm256(int r, int g, int b, const short *taken, int takenCount) {
+	static const int levels[6] = { 0, 95, 135, 175, 215, 255 };
+	long bestDist = -1;
+	short best = 16;
+
+	r = r * 255 / 1000;
+	g = g * 255 / 1000;
+	b = b * 255 / 1000;
+
+	for (int i = 16; i < 256; i++) {
+		int skip = 0;
+		for (int t = 0; t < takenCount; t++)
+			if (taken[t] == i) skip = 1;
+		if (skip) continue;
+
+		int pr, pg, pb;
+		if (i < 232) {		// 6x6x6 color cube
+			pr = levels[(i - 16) / 36];
+			pg = levels[((i - 16) / 6) % 6];
+			pb = levels[(i - 16) % 6];
+		} else {			// grayscale ramp
+			pr = pg = pb = 8 + (i - 232) * 10;
+		}
+
+		long dist = (long)(pr - r) * (pr - r) + (long)(pg - g) * (pg - g)
+				  + (long)(pb - b) * (pb - b);
+		if (bestDist < 0 || dist < bestDist) {
+			bestDist = dist;
+			best = (short)i;
+		}
+	}
+	return best;
+}
+
 void init(struct config *conf, struct ncursesObjects *objects) {
 	savetty();	// save terminal settings
 	initscr();	// init ncurses screen
@@ -1219,8 +1255,16 @@ void init(struct config *conf, struct ncursesObjects *objects) {
 			init_pair(15, 7, bg);
 		}
 
-		if (can_change_color() && COLORS >= 256) {
-			// Full 256-color terminal: define custom seasonal RGB colors
+		// Exactly 256: on direct-color terminals (COLORS = 2^24) a color number
+		// is an RGB value, not a palette slot, so those use the fallback below.
+		if (COLORS == 256) {
+			// Full 256-color terminal: seasonal RGB colors.
+			//
+			// Some terminals (Konsole, for one) claim through terminfo that
+			// colors can be redefined and then ignore it, and
+			// can_change_color() cannot tell. So every color is placed in the
+			// slot whose stock color is already close: if init_color() is
+			// honored we get the exact shade, if not we get a near match.
 			float blend_ratio;
 			enum Season season = resolve_season(conf, &blend_ratio);
 
@@ -1234,19 +1278,26 @@ void init(struct config *conf, struct ncursesObjects *objects) {
 			int g_2 = interpolate_color(current_colors.g_2, prev_colors.g_2, blend_ratio);
 			int b_2 = interpolate_color(current_colors.b_2, prev_colors.b_2, blend_ratio);
 
-			init_color(16, 540, 270, 0);     // Lighter brown for trunk
-			init_color(17, 280, 140, 0);     // Darker brown for branches
-			init_color(18, r,   g,   b);     // Main leaf color
-			init_color(19, r_2, g_2, b_2);  // Darker leaf variant
-			init_color(25, 560, 510, 420);  // Weathered deadwood (jin/shari) — muted driftwood
+			// browns are hand-picked: the nearest slot to the dark one is a dark red
+			short slots[5] = { 130, 94, 101, 0, 0 };	// trunk, branch, deadwood, leaf 1, leaf 2
+			slots[3] = nearestXterm256(r, g, b, slots, 3);
+			slots[4] = nearestXterm256(r_2, g_2, b_2, slots, 4);
 
-			init_pair(20, 16, bg);  // Trunk color
-			init_pair(21, 17, bg);  // Branch color
-			init_pair(22, 18, bg);  // Leaf color 1
-			init_pair(23, 19, bg);  // Leaf color 2
-			init_pair(24, 25, bg);  // Deadwood (bleached)
+			if (can_change_color()) {
+				init_color(slots[0], 540, 270, 0);     // Lighter brown for trunk
+				init_color(slots[1], 280, 140, 0);     // Darker brown for branches
+				init_color(slots[2], 560, 510, 420);   // Weathered deadwood (jin/shari) — muted driftwood
+				init_color(slots[3], r,   g,   b);     // Main leaf color
+				init_color(slots[4], r_2, g_2, b_2);   // Darker leaf variant
+			}
+
+			init_pair(20, slots[0], bg);  // Trunk color
+			init_pair(21, slots[1], bg);  // Branch color
+			init_pair(22, slots[3], bg);  // Leaf color 1
+			init_pair(23, slots[4], bg);  // Leaf color 2
+			init_pair(24, slots[2], bg);  // Deadwood (bleached)
 		} else {
-			// Limited terminal (cygwin, screen, linux console, ssh with basic TERM):
+			// Limited terminal (cygwin, linux console, ssh with basic TERM, direct color):
 			// fall back to the 8 standard colors, season-aware
 			float blend_ratio;
 			enum Season season = resolve_season(conf, &blend_ratio);
