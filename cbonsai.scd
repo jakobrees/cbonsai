@@ -54,7 +54,7 @@ cbonsai is an advanced bonsai tree generator with seasonal color changes, proced
 	life; higher -> more growth (10-500) [default: 60]
 
 *-p*, *--print*
-	print tree to terminal when finished
+	print the tree to the terminal when finished and exit, instead of waiting for a keypress
 
 *-s*, *--seed*=_INT_
 	seed random number generator
@@ -76,6 +76,9 @@ cbonsai is an advanced bonsai tree generator with seasonal color changes, proced
 
 *-v*, *--verbose*
 	increase output verbosity
+
+*--version*
+	show version
 
 *-h*, *--help*
 	show help

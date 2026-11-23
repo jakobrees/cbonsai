@@ -17,6 +17,9 @@
 
 #include "msaw.h"
 
+// program release (unrelated to the save-file engine version)
+#define CBONSAI_VERSION "2.0.0"
+
 
 // ==========================================================================
 // TUNABLE PARAMETERS  (aesthetic / behaviour knobs — safe to retune)
@@ -385,7 +388,7 @@ void growTree_v2(struct config *conf, struct ncursesObjects *objects, struct cou
 
 // dispatch + entry
 struct TreeEngine get_engine(int version);
-void printstdscr(void);
+void printTreeToStdout(const struct ncursesObjects *objects);
 char* createDefaultCachePath(void);
 
 
@@ -679,6 +682,7 @@ void printHelp(void) {
 			"                           [default: $XDG_CACHE_HOME/cbonsai\n"
 			"                            or $HOME/.cache/cbonsai]\n"
 			"  -v, --verbose          increase output verbosity\n"
+			"      --version          show version\n"
 			"  -h, --help             show help\n"
 	);
 }
@@ -1436,7 +1440,7 @@ void finalHold(struct config *conf, struct ncursesObjects *objects,
 			   struct VirtualGrid *skeleton, struct VirtualGrid *trunkPlane,
 			   struct BranchList *branchList,
 			   int trunk_x, int trunk_y, int baseHeight, int *off_x, int *off_y) {
-	if (conf->no_disp || conf->infinite) return;
+	if (conf->no_disp || conf->infinite || conf->printTree) return;
 
 	nodelay(stdscr, FALSE);
 	while (wgetch(stdscr) == KEY_RESIZE) {
@@ -3251,6 +3255,8 @@ void growTree_v2(struct config *conf, struct ncursesObjects *objects, struct cou
 
 #define OPT_SEASON 1002
 
+#define OPT_VERSION 1003
+
 struct TreeEngine get_engine(int version) {
 	struct TreeEngine engine;
 	switch (version) {
@@ -3265,50 +3271,83 @@ struct TreeEngine get_engine(int version) {
 	return engine;
 }
 
-// print stdscr to terminal window
-void printstdscr(void) {
+// Fetch the cell visible at screen position (y, x): the message box sits in
+// front of the tree, as its panels do on screen. Returns 0 if there is none.
+// (Composited by hand rather than with overlay() so that the only curses calls
+// needed are ones the web build's shim also implements.)
+static int visibleCell(const struct ncursesObjects *objects, int y, int x, cchar_t *c) {
+	WINDOW *layers[3] = { objects->messageWin, objects->messageBorderWin, objects->treeWin };
+
+	for (int i = 0; i < 3; i++) {
+		if (!layers[i]) continue;
+		int begY, begX, h, w;
+		getbegyx(layers[i], begY, begX);
+		getmaxyx(layers[i], h, w);
+		if (y < begY || y >= begY + h || x < begX || x >= begX + w) continue;
+		if (mvwin_wch(layers[i], y - begY, x - begX, c) != ERR) return 1;
+	}
+	return 0;
+}
+
+// Read the visible cell at (y, x). Returns 1 if it holds a visible glyph, 0 if
+// it is blank. wch must hold at least 128 wide chars.
+static int readGlyph(const struct ncursesObjects *objects, int y, int x,
+					 wchar_t *wch, attr_t *attrs, short *pair) {
+	cchar_t c;
+	memset(wch, 0, 128 * sizeof(wchar_t));
+	*attrs = 0;
+	*pair = 0;
+	if (!visibleCell(objects, y, x, &c)) return 0;
+	if (getcchar(&c, wch, attrs, pair, 0) == ERR) return 0;
+	return wch[0] != L'\0' && wch[0] != L' ';
+}
+
+// Print the finished tree (-p) as plain terminal output. Call after endwin():
+// the windows' contents outlive the curses screen. Blank rows above the tree
+// and trailing blanks are dropped so the output doesn't fill the screen.
+void printTreeToStdout(const struct ncursesObjects *objects) {
+	if (!objects->treeWin) return;
+
 	int maxY, maxX;
-	getmaxyx(stdscr, maxY, maxX);
+	getmaxyx(objects->treeWin, maxY, maxX);
 
-	// loop through each character on stdscr
+	wchar_t wch[128];
+	attr_t attrs;
+	short pair;
+	int started = 0;
+
 	for (int y = 0; y < maxY; y++) {
-		for (int x = 0; x < maxX; x++) {
-			// grab cchar_t from stdscr
-			cchar_t c;
-			mvwin_wch(stdscr, y, x, &c);
+		int last = -1;
+		for (int x = 0; x < maxX; x++)
+			if (readGlyph(objects, y, x, wch, &attrs, &pair)) last = x;
 
-			// grab wchar_t from cchar_t
-			wchar_t wch[128] = {0};
-			attr_t attrs;
-			short color_pair;
-			getcchar(&c, wch, &attrs, &color_pair, 0);
+		if (last < 0 && !started) continue;
+		started = 1;
 
-			short fg;
-			short bg;
-			pair_content(color_pair, &fg, &bg);
+		for (int x = 0; x <= last; x++) {
+			if (!readGlyph(objects, y, x, wch, &attrs, &pair)) {
+				printf("\033[0m ");
+				continue;
+			}
 
-			// enable bold if needed
-			if(attrs & A_BOLD) printf("\033[1m");
-			else printf("\033[0m");
+			short fg = -1, bg = -1;
+			pair_content(pair, &fg, &bg);
 
-			// enable correct color
-			if (fg == 0) printf("\033[0m");
-			else if (fg <= 7) printf("\033[3%him", fg);
-			else if (fg >= 8) printf("\033[9%him", fg - 8);
-
+			printf("\033[0%sm", (attrs & A_BOLD) ? ";1" : "");
+			// pair 0 and "default" foregrounds keep the terminal's own color
+			if (pair != 0 && fg >= 0) {
+				if (fg < 8)       printf("\033[3%dm", fg);
+				else if (fg < 16) printf("\033[9%dm", fg - 8);
+				else              printf("\033[38;5;%dm", fg);
+			}
 			printf("%ls", wch);
 
-			short clen = wcslen(wch);
-			short cwidth = 0;
-			for (int i = 0; i < clen; ++i)
-				cwidth += wcwidth(wch[i]);
-
-			if (cwidth > 1)
-				x += cwidth - 1;
+			int width = wcwidth(wch[0]);
+			if (width > 1) x += width - 1;
 		}
+		printf("\033[0m\n");
 	}
-
-	printf("\033[0m\n");
+	fflush(stdout);
 }
 
 char* createDefaultCachePath(void) {
@@ -3394,7 +3433,7 @@ int main(int argc, char* argv[]) {
 		{"leaf", required_argument, NULL, 'c'},
 		{"multiplier", required_argument, NULL, 'M'},
 		{"life", required_argument, NULL, 'L'},
-		{"print", required_argument, NULL, 'p'},
+		{"print", no_argument, NULL, 'p'},
 		{"seed", required_argument, NULL, 's'},
 		{"save", required_argument, NULL, 'W'},
 		{"load", required_argument, NULL, 'C'},
@@ -3405,6 +3444,7 @@ int main(int argc, char* argv[]) {
 		{"engine", required_argument, NULL, OPT_ENGINE},
 		{"bare", no_argument, NULL, OPT_BARE},
 		{"season", required_argument, NULL, OPT_SEASON},
+		{"version", no_argument, NULL, OPT_VERSION},
 		{0, 0, 0, 0}
 	};
 
@@ -3594,6 +3634,11 @@ int main(int argc, char* argv[]) {
 			}
 			break;
 
+		case OPT_VERSION:
+			printf("cbonsai %s\n", CBONSAI_VERSION);
+			quit(&conf, &objects, 0);
+			break;
+
 		// option has required argument, but it was not given
 		case ':':
 			switch (optopt) {
@@ -3680,6 +3725,7 @@ int main(int argc, char* argv[]) {
 	} while (conf.infinite);
 
 	finish(&conf, &myCounters);
+	if (conf.printTree) printTreeToStdout(&objects);
 
 	quit(&conf, &objects, 0);
 }

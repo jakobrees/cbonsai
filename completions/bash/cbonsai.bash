@@ -37,12 +37,15 @@ _cbonsai()
     '-s'
     '--seed'
     '--engine'
+    '--bare'
+    '--season'
     '-W'
     '--save'
     '-C'
     '--load'
     '-v'
     '--verbose'
+    '--version'
     '-h'
     '--help'
   )
@@ -54,6 +57,10 @@ _cbonsai()
       ;;
     --engine)
       COMPREPLY=($(compgen -W "1 2" -- "$cur"))
+      return
+      ;;
+    --season)
+      COMPREPLY=($(compgen -W "spring summer autumn late-autumn winter" -- "$cur"))
       return
       ;;
     -[twmTNbcMLs]|--time|--wait|--message|--msgtime|--name|--base|--leaf|--multiplier|--life|--seed)
