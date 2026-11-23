@@ -6,7 +6,7 @@ trunk that wanders, leans, widens, and forks, then clothes it in procedural
 foliage and the occasional patch of weathered deadwood.
 
 <p align="center">
-  <video src="https://github.com/user-attachments/assets/4b403762-a733-483c-be01-b99a042ca404" autoplay loop muted playsinline controls width="80%"></video>
+  <video src="https://github.com/user-attachments/assets/87e3d48d-3009-497e-8848-b3784cf88357" autoplay loop muted playsinline controls width="80%"></video>
 </p>
 
 > 30 trees, grown live. this implementation of cbonsai began as a fork of
@@ -25,6 +25,12 @@ Seasonal palettes — chosen automatically from the date, or forced with
   <img src="assets/winter.png" width="30%" alt="Winter — --season winter">
 </p>
 <p align="center"><sub>early fall&nbsp;·&nbsp;late fall&nbsp;·&nbsp;winter</sub></p>
+
+Falling leaves, with `--falling-leaves`:
+
+<p align="center">
+  <video src="https://github.com/user-attachments/assets/250012d6-5b13-42bc-a569-2b51237356e0" autoplay loop muted playsinline controls width="85%"></video>
+</p>
 
 A giant tree, with a message alongside it:
 
