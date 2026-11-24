@@ -658,6 +658,12 @@ int saveToFile(const struct config *conf, unsigned long long globalTime) {
 	return 0;
 }
 
+// Turn decimal commas into points, so that numbers parse the same everywhere.
+static void commaToPoint(char *s) {
+	for (; *s; s++)
+		if (*s == ',') *s = '.';
+}
+
 // load seed and counter from file
 int loadFromFile(struct config *conf) {
 	FILE* fp = fopen(conf->loadFile, "r");
@@ -671,6 +677,9 @@ int loadFromFile(struct config *conf) {
 	unsigned long long globalTime;
 	time_t creationTime;
 	double secondsPerTick;
+	// read as text: before 2.0.1 this was written with the locale's decimal
+	// separator, so it may have a comma
+	char secondsText[64] = {0};
 
 	char first[16] = {0};
 	if (fscanf(fp, "%15s", first) != 1) {
@@ -681,7 +690,7 @@ int loadFromFile(struct config *conf) {
 
 	if (first[0] == 'v') {
 		conf->version = atoi(first + 1);
-		if (fscanf(fp, "%i %llu %ld %lf", &seed, &globalTime, &creationTime, &secondsPerTick) != 4) {
+		if (fscanf(fp, "%i %llu %ld %63s", &seed, &globalTime, &creationTime, secondsText) != 4) {
 			printf("error: save file could not be read\n");
 			fclose(fp);
 			return 1;
@@ -689,11 +698,20 @@ int loadFromFile(struct config *conf) {
 	} else {
 		conf->version = 1;
 		seed = atoi(first);
-		if (fscanf(fp, "%llu %ld %lf", &globalTime, &creationTime, &secondsPerTick) != 3) {
+		if (fscanf(fp, "%llu %ld %63s", &globalTime, &creationTime, secondsText) != 3) {
 			printf("error: save file could not be read\n");
 			fclose(fp);
 			return 1;
 		}
+	}
+
+	commaToPoint(secondsText);
+	char *secondsEnd;
+	secondsPerTick = strtod(secondsText, &secondsEnd);
+	if (secondsEnd == secondsText) {
+		printf("error: save file could not be read\n");
+		fclose(fp);
+		return 1;
 	}
 
 	// optional extended fields (newer save files); older files simply
@@ -4066,6 +4084,8 @@ char* createDefaultCachePath(void) {
 
 int main(int argc, char* argv[]) {
 	setlocale(LC_ALL, "");
+	// numbers always use a decimal point, in options and in save files
+	setlocale(LC_NUMERIC, "C");
 
 	struct config conf = {	// defaults
 		.live = 0,
@@ -4147,6 +4167,10 @@ int main(int argc, char* argv[]) {
 	int c;
 	int real_save = 0;
 	while ((c = getopt_long(argc, argv, ":lt:iw:Sm:b:c:M:L:ps:C:W:vhPN:T:", long_options, &option_index)) != -1) {
+		// decimal commas are fine too: some people are used to typing them
+		if (optarg && ((c < 128 && strchr("tTwbMLsN", c)) || c == OPT_FALL_RATE || c == OPT_FALL_SPEED))
+			commaToPoint(optarg);
+
 		switch (c) {
 		case 'l':
 			conf.live = 1;
