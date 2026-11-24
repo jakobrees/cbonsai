@@ -1,7 +1,7 @@
 # Maintainer: Jakob Rees
 # Run `updpkgsums && makepkg --printsrcinfo > .SRCINFO` after tagging.
 pkgname=cbonsai-jakobrees
-pkgver=2.0.0
+pkgver=2.0.1
 pkgrel=1
 pkgdesc="Grow bonsai trees in your terminal, with seasonal color and real-time growth"
 arch=('x86_64' 'aarch64')

@@ -21,7 +21,7 @@
 #include "msaw.h"
 
 // program release (unrelated to the save-file engine version)
-#define CBONSAI_VERSION "2.0.0"
+#define CBONSAI_VERSION "2.0.1"
 
 
 // ==========================================================================
